@@ -1,0 +1,11 @@
+# Credentials — this repo is PUBLIC. R2 keys reach the pipeline only as GitHub
+# Actions secrets (see SETUP.md); a local .env is for your own reference and
+# must never be committed.
+.env
+.env.*
+
+out/
+__pycache__/
+*.nc
+*.gif
+*.png
