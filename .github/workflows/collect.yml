@@ -2,10 +2,24 @@ name: collect
 
 on:
   schedule:
-    # Every 3 hours, offset from the top of the hour (GitHub load spikes at :00
-    # make on-the-hour crons unreliable). The pipeline is idempotent — a tick
-    # with no new NOAA run exits in seconds after two cheap list calls.
-    - cron: '23 */3 * * *'
+    # Hourly, offset from the top of the hour (GitHub load spikes at :00 make
+    # on-the-hour crons the least reliable slot). The pipeline is idempotent — a
+    # tick with no newly-promoted run costs ~3 s of network (manifest fetch +
+    # two list calls) and exits.
+    #
+    # Polling rate does NOT drive cost: the 435 MB download happens once per
+    # *operational run SWPC promotes*, ~1–2/day, and no amount of extra polling
+    # creates more of them. What hourly buys is latency. SWPC promotes a run
+    # ~1.3 h after it is created (58491: created 22:10, animation frames
+    # published 23:36), and that lag is not ours to remove — so the polling
+    # interval is the only part of the staleness we control. At 3 h the worst
+    # case was ~4.3 h from run creation to the site; hourly halves it.
+    #
+    # It does slightly raise download count: a 3-hourly tick can step over an
+    # operational run that was superseded inside the window, and hourly catches
+    # both. Bounded by the promotion rate (~1 extra/day at most), and catching
+    # it is the correct behaviour anyway.
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       force:

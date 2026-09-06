@@ -2,14 +2,27 @@
 
 Extracts compact web artifacts from NOAA WSA-Enlil model runs for
 [SpaceWeatherViz](https://spaceweatherviz.com)'s monitor and heliosphere visualization.
-Runs on GitHub Actions every 3 hours (`.github/workflows/collect.yml`) and publishes to
+Runs on GitHub Actions hourly (`.github/workflows/collect.yml`) and publishes to
 Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
 `/api/enlil/frame/...`.
 
 ## Pipeline (`pipeline.py`)
 
-1. Find the newest NOAA run with `pv-ready-data-*/` (walks back up to 6 prefixes in case
-   the newest is mid-upload).
+1. Resolve the **operational** run — the number in SWPC's public animation manifest
+   (`services.swpc.noaa.gov/products/animations/enlil.json`, frames named
+   `enlil_com2_<run>_<time>.jpg`) — and find that prefix in the bucket.
+   ⚠️ **Not the newest prefix.** NOAA publishes every run it makes, and many are
+   single-CME analysis runs rather than the full forecast. They look identical from
+   the inside: same `project`/`case`/`observatory` in `metadata.json`, and
+   `cone2bc.in`'s `lproj` says `..._test_cone` on *every* run, operational ones
+   included — that string is not a marker. Only the cone list differs, and taking
+   the newest silently swaps the product: on 2026-09-06 the newest prefix (58494)
+   modelled one CME while the operational run (58491) carried seven. SWPC renders
+   animation frames for the operational run only (58491 → 200; 58489/58490/58492/58494
+   → 404), which is what makes the manifest authoritative. Promotion lags creation
+   by ~1.3 h; if the manifest can't be read or names a run not yet in the bucket the
+   pipeline exits without republishing, keeping the last good run.
+   `--allow-unofficial` restores newest-wins for local inspection.
 2. Idempotency check against the **live worker** (`/api/enlil/run` is public, so this
    needs no credentials and behaves identically locally and in CI). Same run ⇒ exit.
 3. Download frames at stride 3 (3-hourly, ~57 files ≈ 435 MB), 8-way parallel.
@@ -18,7 +31,8 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
    never references a half-uploaded run.
 6. Prune R2 to the newest 10 runs.
 
-Local dry run (no credentials): `python pipeline.py --dry-run [--force] [--keep-out out/x]`.
+Local dry run (no credentials): `python pipeline.py --dry-run [--force] [--keep-out out/x]
+[--allow-unofficial]`.
 
 Secrets (Actions → repository secrets): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY` — an R2 API token scoped to object read/write on the one bucket.
@@ -39,8 +53,13 @@ Secrets (Actions → repository secrets): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
   `X/Y/Z` give the observer's position in the model frame.
 - `cone2bc.in.*` — raw cone-model input (namelist).
 
-Runs are published only when they contain CMEs. Older prefixes (2023) hold a single
-~31 GB `full3D.tgz` instead — the pipeline only supports the pv layout.
+Runs are published only when they contain CMEs — but **not every published run is the
+operational forecast** (see step 1). Older prefixes (2023) hold a single ~31 GB
+`full3D.tgz` instead — the pipeline only supports the pv layout.
+
+Successive operational runs are often supersets: 58491 (7 cones, created 22:10) and
+58492 (8 cones, 22:19) differ only by one appended cone and their `hash_digest`/`run_id`.
+Do not read "more cones" as "more official" — 58492 was never promoted.
 
 ## Usage
 
