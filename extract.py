@@ -40,6 +40,9 @@ import numpy as np
 
 from regions import AU_KM, BlobTracker, TrackingConfig
 
+# Shared with the tracker's own lineage rule so both agree what a sliver is.
+MIN_BRANCH_FRACTION = TrackingConfig().min_branch_fraction
+
 # Encodings are fixed (run-independent) so iso-thresholds keep physical meaning.
 # ratio: log2 over [-2, 4.5] => 0.25x..22.6x ambient, ~1.8% relative precision
 #   (linear clips: run 20260903 had p99.9 = 9.4, abs max 20.6 at the shock nose).
@@ -148,9 +151,14 @@ class ConeAttributor:
     nose could have travelled by the sampled frame, rather than to a fixed depth.
 
     Once attributed, a cone follows its track through the tracker's `links`.
-    **A split assigns the cone to every fragment.** `regions.py` does not invent a
-    boundary inside connected material, so which fragment carries which CME is not
-    recoverable; naming one would be a guess dressed as an answer.
+    **A split hands the cone to every substantial fragment, but not to slivers.**
+    `regions.py` does not invent a boundary inside connected material, so which
+    fragment carries which CME is genuinely unrecoverable and picking one would be
+    a guess. Spreading without any bound is worse, though: it compounds, and late
+    in a 57-frame run — where the field merges into one cloud and then breaks up
+    at the outer shell — it put all 9 cones of 20260906_58495 onto all 7 pieces,
+    every CME lighting every blob. The cut is `min_branch_fraction`, the same rule
+    the tracker uses for its own lineage, so the two agree on what a sliver is.
     """
 
     def __init__(self, cones, lon, lat, rad, earth_lon):
@@ -187,10 +195,22 @@ class ConeAttributor:
         predecessors = [{link['trackId'] for link in r['links']} for r in records]
         live = {r['trackId'] for r in records}
         for k, held in self.tracks.items():
-            moved = {r['trackId'] for r, p in zip(records, predecessors) if p & held}
-            # `moved` is empty for a track that ended; `held & live` keeps an
-            # unlinked survivor rather than dropping a cone on one weak frame.
-            self.tracks[k] = moved or (held & live)
+            moved = [r for r, p in zip(records, predecessors) if p & held]
+            # ⚠️ **A split must not hand the cone to every fragment.** Doing so
+            # compounds: late in a 57-frame run the whole field merges into one
+            # cloud and then breaks up at the outer shell, and an unbounded rule
+            # put all 9 cones of 20260906_58495 on all 7 pieces — every CME
+            # lighting every blob, which is worse than no answer. Keep only the
+            # fragments that carry real material, using the tracker's own lineage
+            # rule (min_branch_fraction) so the two agree on what a sliver is.
+            if moved:
+                biggest = max(r['cellCount'] for r in moved)
+                floor = biggest * MIN_BRANCH_FRACTION
+                self.tracks[k] = {r['trackId'] for r in moved if r['cellCount'] >= floor}
+            else:
+                # Nothing linked: keep an unlinked survivor rather than dropping a
+                # cone on one weak frame; an ended track resolves to empty.
+                self.tracks[k] = held & live
             if self.tracks[k]:
                 self.info[k]['lastFrame'] = num
 
@@ -220,9 +240,19 @@ class ConeAttributor:
                                         if record['trackId'] in held)
 
     def summary(self):
-        """Per-cone attribution, positionally aligned with the run's cone list."""
+        """Per-cone attribution, positionally aligned with the run's cone list.
+
+        ⚠️ `trackIds` is **where the cone was identified**, at injection — not
+        where its material had drifted by the last frame. Those differ once
+        clouds merge, and reporting the drifted set made every cone in a run look
+        identical (all 9 of 20260906_58495 came back as the same 7 late-run
+        fragments, which says nothing about any of them). The live, per-frame
+        answer is `coneIdxs` on each region in the manifest; this field is the
+        provenance of the match, and `footprintShare`/`tracksInFootprint` are the
+        evidence for it.
+        """
         return [dict(self.info.get(k, {'frame': None, 'trackIds': []}),
-                     trackIds=sorted(self.tracks.get(k, self.info.get(k, {}).get('trackIds', []))))
+                     lastTrackIds=sorted(self.tracks.get(k, [])))
                 for k in range(len(self.cones))]
 
 

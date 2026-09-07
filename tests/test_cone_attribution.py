@@ -119,7 +119,7 @@ class ConeAttributionTests(unittest.TestCase):
         self.assertEqual(len(frames[2]), 1)
         self.assertEqual(frames[2][0]['coneIdxs'], [0, 1])
 
-    def test_a_split_gives_the_cone_to_every_fragment(self):
+    def test_a_split_gives_the_cone_to_every_substantial_fragment(self):
         """Shared DP cannot say which fragment kept the CME; claiming one would guess."""
         cones = [cone(0.5, 0.0, -30.0, half=40.0)]
         _, frames = self.run_frames(
@@ -130,6 +130,21 @@ class ConeAttributionTests(unittest.TestCase):
         self.assertEqual(len(frames[2]), 2)
         for region in frames[2]:
             self.assertEqual(region['coneIdxs'], [0])
+
+    def test_a_sliver_breaking_off_does_not_inherit_the_cone(self):
+        """Unbounded spread compounds: late in a run it put every cone on every blob."""
+        cones = [cone(0.5, 0.0, -30.0, half=40.0)]
+        def sliver(dp):
+            blob(dp, 0.0, -30.0, half=30)            # the cloud, unchanged
+            dp[0, 0, 40] = 1.0                       # one detached cell far away
+            return dp
+        _, frames = self.run_frames(
+            cones, [lambda dp: dp, lambda dp: blob(dp, 0.0, -30.0, half=30), sliver])
+        big = max(frames[2], key=lambda r: r['cellCount'])
+        small = [r for r in frames[2] if r is not big]
+        self.assertEqual(big['coneIdxs'], [0])
+        for r in small:
+            self.assertEqual(r['coneIdxs'], [], 'a sliver must not inherit the cone')
 
 
 if __name__ == '__main__':
