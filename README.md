@@ -26,7 +26,8 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
 2. Idempotency check against the **live worker** (`/api/enlil/run` is public, so this
    needs no credentials and behaves identically locally and in CI). Same run ⇒ exit.
 3. Download frames at stride 3 (3-hourly, ~57 files ≈ 435 MB), 8-way parallel.
-4. `extract.py` (volumes off until the site's 3D view lands).
+4. `extract.py`: quantize the fields and track DP blobs through the float 3D volumes
+   with `regions.py`. Volume *exports* stay off until the site's 3D view lands.
 5. Upload to `enlil/<runId>/…`; `enlil/latest.json` is written **last** so the pointer
    never references a half-uploaded run.
 6. Prune R2 to the newest 10 runs.
@@ -70,7 +71,7 @@ python extract.py --run-dir <dir with pv-tim.*.nc + metadata.json + evo.earth.nc
 
 ## Artifact format (consumed by the frontend)
 
-All binaries are u8; per-field encodings live in `meta.json.scales` and are **fixed**
+Field binaries are u8; per-field encodings live in `meta.json.scales` and are **fixed**
 (run-independent) so thresholds keep physical meaning:
 
 - `ratio` — log2: `value = 2^(q/255 * (max-min) + min)` with min −2, max 4.5
@@ -80,8 +81,8 @@ All binaries are u8; per-field encodings live in `meta.json.scales` and are **fi
 - `dp` — sqrt: `value = (q/255)² * max`, max 6 (resolution at faint cloud edges).
 
 The density field stored is the **excess-density ratio** `Density / ambient(lat, r)`
-where ambient is the azimuthal median of the first (pre-CME) frame — the CME is the
-only bright object; 1.0 ≈ quiet wind.
+where ambient is the azimuthal median of the first frame. This normalizes radial
+contrast; it does not subtract structured background wind or identify CMEs.
 
 | File | Shape (row-major) | Content |
 |---|---|---|
@@ -92,6 +93,150 @@ only bright object; 1.0 ≈ quiet wind.
 | `voldp_NNNN.bin` | 90 lon × 30 lat × 64 r | full DP volume |
 | `line.bin` | nframes × 64 r × 3 | Sun→Earth line: ratio, vr, dp per frame |
 | `meta.json` | — | frame times, grid, scales, ambient curve, Earth lon/lat, CME params |
+| `blobs_<tag>.json` | — | float-DP 3D blob tracks, per-frame statistics/ancestry, and each region's `coneIdxs` |
+| `labels_<tag>_NNNN.bin` | 90 lon × 64 r | **little-endian uint16** track IDs in the Earth-plane slice |
 
 The "ecliptic" slice plane is the latitude cell nearest Earth's model latitude (from
 `evo.earth.nc`), recorded as `grid.eclipticLatIndex`.
+
+## Blob tracking (`regions.py`)
+
+Every extraction now runs `BlobTracker` on the original floating-point `DP` and
+`Vr` volumes, including with `--no-volumes`. Only the previous frame's cloud cells
+and velocities are retained. The monitor currently still builds its outlines in
+JavaScript; these additional artifacts are available through the Worker's existing
+`/api/enlil/frame/<runId>/<file>` route for inspection and subsequent integration.
+
+The tracker:
+
+1. Labels six-connected cells with finite `DP > 0.25`, wrapping longitude only.
+   Small clouds are retained by default (`min_cells=1`). A track can have multiple
+   disconnected pieces in the displayed slice because connectivity is computed in 3D.
+   NOAA pv latitude is stored **north to south**; this order is preserved. Longitude
+   and radius increase. Uniform-axis checks tolerate source float32 rounding.
+   NetCDF masked DP/Vr values become NaN, so finite fill-value sentinels cannot
+   masquerade as clouds or enormous propagation speeds.
+2. Predicts the next cloud mask using each cell's `Vr` and the actual time interval,
+   in AU. Material leaving the radial domain is discarded, never clamped to its edge.
+3. Links overlapping predicted/observed masks using intersection divided by the
+   smaller component size (default minimum 0.25). When direct overlap fails, a one-cell
+   tolerance in each grid direction is allowed; direct links take precedence. The
+   tolerance score is capped at 1 and is **geometric evidence, not a probability**.
+4. Keeps an ID for a one-to-one continuation. Merges, splits, and many-to-many
+   reconfigurations receive new IDs with `parentTrackIds` and `originTrackIds`.
+   Splitting after a merge retains the combined ancestry: shared DP cannot recover
+   which original CME owns each fragment. No watershed boundary is invented.
+
+When links branch, a component smaller than 5% of its largest sibling does not
+cause a merge/split identity reset (`min_branch_fraction`). The small component
+still receives its own track. This suppresses topology churn from one-cell tracer
+specks while retaining young clouds; it is not an absolute detection-size cutoff.
+Set the fraction to zero to preserve every qualifying lineage edge.
+
+IDs are positive uint16 values, scoped to `(runId, artifactTag)`; zero means background.
+A run makes a few hundred tracks at most (55 across 20260906_58495), so uint16 keeps the
+per-frame label file at 11.5 KB rather than 23 KB; `update()` raises rather than wrapping
+if a run ever exceeds it. Read the width from `meta.blobTracking.labelDtype`.
+The tag hashes the algorithm version and configuration. **Bump `TRACKING_VERSION`
+when changing the algorithm or schema** so immutable URLs never reuse stale labels.
+Changing configuration generates a new tag automatically. To extract the currently
+published run again, the existing pipeline `--force` option bypasses its run-ID check.
+
+`meta.json.blobTracking` identifies the manifest, label pattern, byte order and layout.
+The manifest includes grid metadata and a `frames` array in simulation-time order:
+
+```json
+{
+  "frame": "0003",
+  "time": "2026-09-01T03:00:00Z",
+  "labelsFile": "labels_<tag>_0003.bin",
+  "gapReset": false,
+  "endedTrackIds": [],
+  "regions": [{
+    "trackId": 1,
+    "event": "continue",
+    "parentTrackIds": [],
+    "originTrackIds": [1],
+    "links": [{"trackId": 1, "overlap": 0.8, "method": "direct"}],
+    "cellCount": 40,
+    "sliceCellCount": 8,
+    "centroid": {"lon": 180, "lat": 0, "rAU": 0.4},
+    "radialRangeAU": [0.3, 0.5],
+    "latitudeRangeDeg": [-4, 4],
+    "peakDp": 1.2,
+    "medianVrKms": 600,
+    "coneIdxs": [0, 2]
+  }]
+}
+```
+
+`event` is `initial`, `birth`, `continue`, `merge`, `split`, `reconfigure`, or `gap`.
+Parent/origin IDs describe track ancestry; `links` references the preceding frame.
+`endedTrackIds` includes tracks lost to thresholding, exiting the domain, or replaced
+at a topology change; it does not claim the material dissipated. `sliceCellCount=0`
+means a cloud exists elsewhere in the volume but does not intersect this slice.
+Centroids are spherical-cell-volume weighted, with a circular longitude mean (`null`
+when no longitude direction is defined); coordinates remain in the source grid frame.
+
+## Cone attribution (`extract.py: ConeAttributor`)
+
+`regions.py` stays CME-agnostic; the join to NOAA's cone list lives in the extractor,
+because it needs the **full 3D label volume**, and only the Earth-plane slice is ever
+written. A consumer cannot redo it later.
+
+A cone is read off its **injection footprint** — the label already present in the wedge
+it occupies, from the inner boundary out to its ballistic nose at the first frame at or
+after `cme_time`. It is not matched to a newly-born component, because a cone injected
+into material that already exists never creates one: on run 20260906_58495 three of nine
+cones (both at lat −4/lon −28, and lat +19/lon −75) produced **no birth event at all**.
+The footprint read handles those and the ordinary case with one rule, and the widening
+shell range also reaches cones injected before the run's first saved frame (spin-up).
+
+Measured on that run, all nine cones resolved with **exactly one track in the footprint**
+— nothing to tie-break — and across 19 frames every slice-visible region (≥5 cells) had
+at least one cone, with **no cone ever appearing in two visible regions**.
+
+Both directions of the join are published: regions carry `coneIdxs` (indices into
+`meta.cmes`), and each cone carries `tracking`:
+
+```json
+{"frame": "0018", "trackIds": [48], "lastFrame": "0054",
+ "footprintShare": 0.2424, "tracksInFootprint": 1}
+```
+
+`trackIds: []` with a `note` is an honest "no visible material", not a lookup failure.
+`footprintShare` and `tracksInFootprint` are there to be audited — a low share, or more
+than one track in a footprint, marks an attribution worth checking.
+
+**A split assigns the cone to every fragment.** The tracker refuses to invent a boundary
+inside connected material, so which fragment kept which CME is unrecoverable; naming one
+would be a guess. **Consumers should key a pinned selection on `originTrackIds`, not
+`trackId`** — `trackId` is reassigned at every merge/split, while the sorted origin set
+is stable for the life of the physical cloud.
+
+Filtering rule for display: track everything (`min_cells=1` keeps young clouds), then
+drop specks at the consumer. Size is the weaker test — the reliable one is that every
+genuine injection is born with `radialRangeAU[0] == grid.rad.min`, while tracer specks
+are born mid-domain (0.94, 1.19 AU on the run above).
+
+Limits: `regions.py` itself is geometric DP tracking only — cone attribution is a
+separate stage (above) and DONKI matching happens in the Worker (`lib/cmeMatch.js`).
+It does not find untagged CMEs in density. Missing detections end a track; there is no
+hidden extrapolation through an empty frame. Gaps longer than six hours reset
+association. Missing/negative velocity cells provide no prediction evidence. The pv
+files have only radial velocity, so transverse motion is not reconstructed. A known
+longitude drift can be supplied in grid degrees/day; its default is zero, not an
+assumed solar rotation rate. Synthetic tests verify the mechanics; these thresholds
+still need evaluation against multiple real runs before replacing browser attribution.
+The saved run `20260903_58484` was also replayed through extraction (57 frames),
+including verification that every slice label agrees with the manifest's counts.
+
+CLI settings: `--dp-threshold 0.25` and `--tracking-longitude-rate 0.0`. Other settings
+are exposed through `TrackingConfig` passed to `extract_run(..., tracking_config=...)`.
+The existing field encodings and cone metadata are unaffected by these settings.
+
+Run verification from this directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
