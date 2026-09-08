@@ -11,7 +11,7 @@ Steps:
   2. Idempotency: read enlil/latest.json straight from R2 (the source of truth
      the worker merely serves). Same run ⇒ exit 0. A credential-free --dry-run
      falls back to the public worker endpoint.
-  3. Download pv-tim frames at FRAME_STRIDE (3 ⇒ 3-hourly, ~57 files ≈ 435 MB)
+  3. Download the pv-tim frames frame_schedule() selects (~113 files ≈ 860 MB)
      plus metadata.json and evo.earth.nc, in parallel.
   4. extract.py → u8 artifacts (volumes off until the 3D page needs them).
   5. Upload to R2 enlil/<runId>/…, then write enlil/latest.json last — the
@@ -44,11 +44,43 @@ WORKER_RUN_URL = 'https://spaceweatherviz-api.lakitzi.workers.dev/api/enlil/run'
 # SWPC's public WSA-Enlil animation — the authority on which run is operational.
 SWPC_ANIMATION_URL = 'https://services.swpc.noaa.gov/products/animations/enlil.json'
 USER_AGENT = 'swv-enlil-pipeline (+https://github.com/einatsof/swv-enlil-pipeline)'
-FRAME_STRIDE = 3
+# Frame schedule. A NOAA run is a fixed 169 hourly frames in which frame N is
+# rundate + (N - 48) h — 48 h of hindcast, then 120 h of forecast. Verified on
+# 20260907_58498: rundate_cal 2026-09-07T18, frame 0000 = 2026-09-05T18:01Z,
+# frame 0168 = 2026-09-12T18:01Z. extract.py re-checks this per run and warns.
+#
+# Resolution goes where it is read, rather than spread evenly:
+#   frames 0000-0084 (rundate -48 h .. +36 h) hourly, because
+#     - every cone is injected in the hindcast (across four runs sampled, every
+#       `cme_time` was <= rundate, spread over frames ~0 to ~48 — cones come
+#       from observed events, so they are always in the past at run time), and
+#       ConeAttributor reads a cone off the footprint of the first frame at or
+#       after injection, making the sampling interval its quantisation error;
+#     - a run becomes displayable around rundate +5..7 h (NOAA writes the pv
+#       data at +3..5 h, SWPC promotion adds ~1.3 h, then our hourly cron), so
+#       this band's forecast half is the first ~31 h anyone sees.
+#   frames 0084-0168 (+36 h .. +120 h) 3-hourly — the previous resolution
+#     everywhere, so no regression, and blob tracking must continue through it:
+#     mid and slow CMEs reach 1 AU inside this band (58491 lands four of seven
+#     cones at frame >= 84; 58498's single 409 km/s cone crosses at frame ~138).
+#
+# ⚠️ **Never let a step exceed 5 frames.** Frame spacing is not exactly 3600 s;
+# it jitters (measured 3567-3634 s/frame on 20260903_58484), so a nominal 6 h
+# stride reaches 6.06 h — over `regions.TrackingConfig.max_gap_hours` (6.0),
+# which drops every link for that step: all tracks reborn with new IDs and the
+# cone attribution riding those links lost for the rest of the run.
+STANDARD_FRAMES = 169
+HOURLY_THROUGH = 84
+TAIL_STRIDE = 3
+# Any run that is not the standard shape is sampled evenly instead — index-based
+# boundaries would land somewhere else entirely. 20260905_58489 published only
+# 45 frames, and describe_run() accepts anything from 20 up.
+FALLBACK_STRIDE = 3
 KEEP_RUNS = 10
 DOWNLOAD_WORKERS = 8
 
 RUN_PREFIX_RE = re.compile(r'^wsa_enlil\.(\d{8})(?:_(\d+))?/$')
+PV_FRAME_RE = re.compile(r'/pv-tim\.(\d+)\.nc$')
 # e.g. /images/animations/enlil/enlil_com2_58491_20260903T220000.jpg
 ANIMATION_FRAME_RE = re.compile(r'enlil_\w+?_(\d+)_\d{8}T\d{6}\.jpg')
 
@@ -199,10 +231,33 @@ def published_run_id_via_worker():
         return None
 
 
+def frame_schedule(pvtims):
+    """The pv-tim keys to download: hourly through HOURLY_THROUGH, then TAIL_STRIDE.
+
+    Indexed by position rather than by timestamp on purpose: frame times live
+    inside the pv files, so they are unknowable before choosing what to fetch.
+    The standard-shape guard is what makes positions meaningful, and extract.py
+    warns if a downloaded run's frame 0000 is not rundate - 48 h after all.
+    """
+    nums = [m.group(1) for m in (PV_FRAME_RE.search(k) for k in pvtims) if m]
+    standard = (len(nums) == len(pvtims) == STANDARD_FRAMES
+                and nums == [f'{i:04d}' for i in range(STANDARD_FRAMES)])
+    if standard:
+        keys = [k for i, k in enumerate(pvtims)
+                if i <= HOURLY_THROUGH or (i - HOURLY_THROUGH) % TAIL_STRIDE == 0]
+    else:
+        print(f'non-standard run shape ({len(pvtims)} pv frames): '
+              f'sampling evenly at stride {FALLBACK_STRIDE}')
+        keys = pvtims[::FALLBACK_STRIDE]
+    # The last frame always ships: it is the run's forecast horizon, and the
+    # widget blanks the field once "now" passes it.
+    if pvtims[-1] not in keys:
+        keys.append(pvtims[-1])
+    return keys
+
+
 def download_run(s3, run, dest):
-    keys = run['pvtims'][::FRAME_STRIDE]
-    if run['pvtims'][-1] not in keys:
-        keys.append(run['pvtims'][-1])
+    keys = frame_schedule(run['pvtims'])
     keys += [run['meta'], run['evo']]
     print(f'downloading {len(keys)} files from {run["prefix"]}')
 

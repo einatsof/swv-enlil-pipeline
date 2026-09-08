@@ -25,7 +25,31 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
    `--allow-unofficial` restores newest-wins for local inspection.
 2. Idempotency check against the **live worker** (`/api/enlil/run` is public, so this
    needs no credentials and behaves identically locally and in CI). Same run ⇒ exit.
-3. Download frames at stride 3 (3-hourly, ~57 files ≈ 435 MB), 8-way parallel.
+3. Download the frames `frame_schedule()` selects (~113 files ≈ 860 MB), 8-way parallel.
+   A run is a fixed 169 hourly frames where **frame N is `rundate` + (N − 48) h** —
+   48 h of hindcast, then 120 h of forecast (verified on 20260907_58498:
+   `rundate_cal` 2026-09-07T18, frame 0000 = 09-05T18:01Z, frame 0168 = 09-12T18:01Z;
+   `extract.py` re-checks it per run and warns). Resolution goes where it is read:
+   **frames 0000–0084 hourly, 0084–0168 3-hourly.**
+   - *Hourly through rundate +36 h* because **every cone is injected in the
+     hindcast** — across the four runs sampled every `cme_time` was ≤ `rundate`,
+     spread over frames ~0–48, since cones come from observed events and are
+     always in the past at run time — and `ConeAttributor` reads a cone off the
+     footprint of the first frame at or after injection, so the sampling interval
+     *is* its quantisation error. The band's forecast half is also the first ~31 h
+     a run is on screen (it becomes displayable ~`rundate` +5–7 h: NOAA writes the
+     pv data at +3–5 h, SWPC promotion adds ~1.3 h, then the hourly cron).
+   - *3-hourly after* — the cadence the whole run used to get, so nothing regresses,
+     and **tracking must continue through it**: mid and slow CMEs reach 1 AU inside
+     this band (58491 lands four of seven cones at frame ≥ 84; 58498's single
+     409 km/s cone crosses at frame ~138 and never leaves the 1.688 AU domain).
+   - ⚠️ **No step may exceed 5 frames.** Spacing is not exactly 3600 s — it jitters
+     (measured 3567–3634 s/frame on 20260903_58484), so a nominal 6 h stride reaches
+     **6.06 h**, over `TrackingConfig.max_gap_hours` (6.0). That drops every link for
+     the step: all tracks reborn with new IDs, and the cone attribution riding those
+     links lost for the rest of the run.
+   - A run that is not the standard 169-frame shape is sampled evenly at stride 3
+     instead; index-based boundaries would land somewhere else entirely.
 4. `extract.py`: quantize the fields and track DP blobs through the float 3D volumes
    with `regions.py`. Volume *exports* stay off until the site's 3D view lands.
 5. Upload to `enlil/<runId>/…`; `enlil/latest.json` is written **last** so the pointer

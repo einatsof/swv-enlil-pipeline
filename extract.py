@@ -102,6 +102,25 @@ def earth_position(run_dir):
     return float(np.median(lon)), float(np.median(lat))
 
 
+# pipeline.py picks frames by index, assuming frame N is rundate + (N - 48) h.
+# It cannot check that itself (frame times live inside the pv files it is
+# choosing between), so the check lands here, where both are in hand.
+HINDCAST_HOURS = 48.0
+
+
+def parse_rundate(run_dir):
+    """NOAA's issue time from `rundate_cal` (hour resolution), or None."""
+    path = os.path.join(run_dir, 'metadata.json')
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        raw = str(json.load(f).get('rundate_cal', '') or '')
+    m = re.match(r'(\d{4}-\d{2}-\d{2})T(\d{2})', raw)
+    if not m:
+        return None
+    return datetime.fromisoformat(f'{m.group(1)}T{m.group(2)}:00:00+00:00')
+
+
 def parse_cmes(run_dir):
     """CME cone parameters from NOAA's pv-ready metadata.json (comma-joined strings)."""
     path = os.path.join(run_dir, 'metadata.json')
@@ -268,6 +287,15 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
 
     first = read_frame(frames[0])
     lat, rad, lon = first['lat'], first['rad'], first['lon']
+    rundate = parse_rundate(run_dir)
+    if rundate is not None and frame_number(frames[0]) == '0000':
+        # A shift here does not make the run unusable — it means pipeline.py's
+        # hourly band no longer lines up with cone injection, so the schedule
+        # needs revisiting. Warn rather than fail: the artifacts are still valid.
+        offset = (first['time'] - rundate).total_seconds() / 3600
+        if abs(offset + HINDCAST_HOURS) > 1.5:
+            print(f'warning: frame 0000 is rundate{offset:+.1f} h, expected '
+                  f'{-HINDCAST_HOURS:+.0f} h — revisit the frame schedule in pipeline.py')
     earth_lon, earth_lat = earth_position(run_dir)
     # Slice plane: latitude cell nearest Earth (ENLIL's "earth plane"), not blindly the middle.
     ecl = int(np.argmin(np.abs(lat - (earth_lat if earth_lat is not None else 0.0))))
@@ -333,6 +361,9 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
     meta = {
         'runId': run_id or os.path.basename(os.path.normpath(run_dir)),
         'generated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        # NOAA's issue time. Published so a consumer can tell hindcast frames
+        # from forecast ones without assuming the 48 h split.
+        'rundate': rundate.strftime('%Y-%m-%dT%H:%M:%SZ') if rundate else None,
         'frames': frame_ids,
         'times': times,
         'grid': {
