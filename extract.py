@@ -43,6 +43,14 @@ from regions import AU_KM, BlobTracker, TrackingConfig
 # Shared with the tracker's own lineage rule so both agree what a sliver is.
 MIN_BRANCH_FRACTION = TrackingConfig().min_branch_fraction
 
+# How long ConeAttributor keeps looking for a cone's material before recording
+# that there is none. Bounded so the wedge stays an *injection* footprint rather
+# than a sweep of the domain: at 700 km/s six hours puts the nose at 0.10 AU,
+# about four radial cells past the 0.1125 AU inner boundary. It also clears the
+# "cloud too young to label" wait for any realistic cone — one radial cell takes
+# 1.1 h at 970 km/s, 1.5 h at 690 and 3.5 h even at 300.
+ATTRIBUTION_WINDOW_HOURS = 6.0
+
 # Encodings are fixed (run-independent) so iso-thresholds keep physical meaning.
 # ratio: log2 over [-2, 4.5] => 0.25x..22.6x ambient, ~1.8% relative precision
 #   (linear clips: run 20260903 had p99.9 = 9.4, abs max 20.6 at the shock nose).
@@ -156,7 +164,10 @@ class ConeAttributor:
     list *and* the full 3D label volume, which is never exported (only the
     Earth-plane slice is), so no downstream consumer could do it later.
 
-    **A cone is read off its injection footprint**, not matched to a new track.
+    **A cone is read off its injection footprint**, not matched to a new track —
+    but only once that footprint can contain anything (see ATTRIBUTION_WINDOW_HOURS
+    and the wait in `update`; reading the first frame after `cme_time` regardless
+    made the answer depend on the download cadence).
     Matching a cone to a newly-born component only works when the cone creates
     one: measured on run 20260906_58495, three of nine cones (the two at
     lat -4/lon -28 and the one at lat +19/lon -75) were injected into material
@@ -237,14 +248,37 @@ class ConeAttributor:
             k, cme_time = entry
             if frame_time < cme_time:
                 continue                      # not injected yet; try again next frame
-            self.pending.remove(entry)
-            i, j, kk = self._footprint(self.cones[k], frame_time, cme_time)
+            cone = self.cones[k]
+            hours = (frame_time - cme_time).total_seconds() / 3600
+            # A cone injected before the run's first saved frame arrives here
+            # already past the window, so spin-up cones still resolve on frame 0.
+            expired = hours >= ATTRIBUTION_WINDOW_HOURS
+            speed = cone.get('speed') or 0.0
+            # ⚠️ **An empty footprint is evidence only once the cloud could be
+            # there.** DP material enters at the inner boundary at `cme_time` and
+            # has to clear a radial cell before anything can label it, so a frame
+            # moments after injection says nothing about the cone. Reading one
+            # anyway and giving up made attribution depend on which frames we
+            # happened to download: at 3-hourly the first look landed ~2 h in and
+            # found the cloud, and hourly moved it to +5 min for cone1 of
+            # 20260907_58497 (0 labelled cells in its wedge at frame 0004, 8 at
+            # 0005, 12 at 0006), permanently marking a real CME untraced. The
+            # coarse cadence was never *correct* here, only lucky — a cone
+            # injected just before a 3-hourly frame failed the same way. Wait for
+            # the cloud, then retry; that is what makes this cadence-independent.
+            if speed > 0 and not expired and speed * hours * 3600 / AU_KM < self.dr:
+                continue
+            i, j, kk = self._footprint(cone, frame_time, cme_time)
             patch = labels[np.ix_(i, j, kk)].ravel() if len(i) and len(j) else np.empty(0, labels.dtype)
             present = patch[patch > 0]
             if not len(present):
+                if not expired:
+                    continue                  # still inside the window; look again
+                self.pending.remove(entry)
                 self.info[k] = {'frame': None, 'trackIds': [],
                                 'note': 'no tracked material in the injection footprint'}
                 continue
+            self.pending.remove(entry)
             ids, counts = np.unique(present, return_counts=True)
             best = int(ids[int(np.argmax(counts))])
             self.tracks[k] = {best}
@@ -270,7 +304,12 @@ class ConeAttributor:
         provenance of the match, and `footprintShare`/`tracksInFootprint` are the
         evidence for it.
         """
-        return [dict(self.info.get(k, {'frame': None, 'trackIds': []}),
+        # A cone still pending means the run ended inside its search window —
+        # a different answer from "looked and found nothing", and only reachable
+        # on a truncated run, since the last frame is rundate +120 h.
+        unresolved = {'frame': None, 'trackIds': [],
+                      'note': 'run ended before the attribution window closed'}
+        return [dict(self.info.get(k, unresolved),
                      lastTrackIds=sorted(self.tracks.get(k, [])))
                 for k in range(len(self.cones))]
 

@@ -53,9 +53,13 @@ USER_AGENT = 'swv-enlil-pipeline (+https://github.com/einatsof/swv-enlil-pipelin
 #   frames 0000-0084 (rundate -48 h .. +36 h) hourly, because
 #     - every cone is injected in the hindcast (across four runs sampled, every
 #       `cme_time` was <= rundate, spread over frames ~0 to ~48 — cones come
-#       from observed events, so they are always in the past at run time), and
-#       ConeAttributor reads a cone off the footprint of the first frame at or
-#       after injection, making the sampling interval its quantisation error;
+#       from observed events, so they are always in the past at run time), so
+#       the tracker sees their whole lives at full resolution;
+#       ⚠️ this band does NOT exist to help cone attribution. That argument was
+#       made when the schedule landed and it was backwards: sampling sooner after
+#       injection reads the footprint *before* the DP cloud can be labelled. See
+#       ATTRIBUTION_WINDOW_HOURS in extract.py — attribution is now independent
+#       of cadence, and this band neither helps nor hurts it;
 #     - a run becomes displayable around rundate +5..7 h (NOAA writes the pv
 #       data at +3..5 h, SWPC promotion adds ~1.3 h, then our hourly cron), so
 #       this band's forecast half is the first ~31 h anyone sees.

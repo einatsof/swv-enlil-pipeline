@@ -21,7 +21,10 @@ AU_KM = 149_600_000.0
 # ceiling rather than letting IDs silently wrap.
 LABEL_DTYPE = np.uint16
 # Bump when algorithm/output semantics change: artifacts are immutable in R2.
-TRACKING_VERSION = 2
+# 3: ConeAttributor waits for a cone's material instead of reading the first
+#    frame after injection and giving up — `coneIdxs` in blobs_<tag>.json changes
+#    meaning, and re-extracting a published run would otherwise reuse its URL.
+TRACKING_VERSION = 3
 
 
 @dataclass(frozen=True)

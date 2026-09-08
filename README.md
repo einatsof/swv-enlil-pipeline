@@ -34,9 +34,13 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
    - *Hourly through rundate +36 h* because **every cone is injected in the
      hindcast** — across the four runs sampled every `cme_time` was ≤ `rundate`,
      spread over frames ~0–48, since cones come from observed events and are
-     always in the past at run time — and `ConeAttributor` reads a cone off the
-     footprint of the first frame at or after injection, so the sampling interval
-     *is* its quantisation error. The band's forecast half is also the first ~31 h
+     always in the past at run time — so the tracker follows their whole lives at
+     full resolution. ⚠️ **It is not here to help cone attribution.** That was the
+     original argument and it was backwards: a finer cadence reads the injection
+     footprint *before* the DP cloud can be labelled at all. `ConeAttributor` now
+     waits for the material (`ATTRIBUTION_WINDOW_HOURS`), so attribution is
+     cadence-independent and this band neither helps nor hurts it.
+     The band's forecast half is also the first ~31 h
      a run is on screen (it becomes displayable ~`rundate` +5–7 h: NOAA writes the
      pv data at +3–5 h, SWPC promotion adds ~1.3 h, then the hourly cron).
    - *3-hourly after* — the cadence the whole run used to get, so nothing regresses,
@@ -215,6 +219,18 @@ into material that already exists never creates one: on run 20260906_58495 three
 cones (both at lat −4/lon −28, and lat +19/lon −75) produced **no birth event at all**.
 The footprint read handles those and the ordinary case with one rule, and the widening
 shell range also reaches cones injected before the run's first saved frame (spin-up).
+
+⚠️ **The read waits for material rather than settling on one frame.** DP enters at the
+inner boundary at `cme_time`, so a frame taken moments later cannot show the cloud — the
+attributor defers until the nose has cleared one radial cell and keeps retrying until
+`ATTRIBUTION_WINDOW_HOURS` (6 h) before recording that there is none. Without the wait,
+attribution silently depended on the download cadence: hourly sampling moved the first
+look at cone1 of `20260907_58497` from +2.08 h to **+5 min** (0 labelled cells in its
+wedge at frame 0004, 8 at 0005, 12 at 0006) and untraced a real CME for the whole run.
+The old 3-hourly cadence was not correct here, only lucky — a cone injected just before a
+frame failed the same way. The window is bounded so a cone cannot latch onto material
+that merely drifts through the wedge much later; a spin-up cone arrives already past it
+and still resolves on frame 0.
 
 Measured on that run, all nine cones resolved with **exactly one track in the footprint**
 — nothing to tie-break — and across 19 frames every slice-visible region (≥5 cells) had

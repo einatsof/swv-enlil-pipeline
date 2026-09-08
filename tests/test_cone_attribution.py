@@ -10,7 +10,7 @@ import unittest
 
 import numpy as np
 
-from extract import ConeAttributor
+from extract import ATTRIBUTION_WINDOW_HOURS, ConeAttributor
 from regions import AU_KM, BlobTracker
 
 LON = np.arange(36) * 10.0                 # 10 deg cells, full circle
@@ -145,6 +145,69 @@ class ConeAttributionTests(unittest.TestCase):
         self.assertEqual(big['coneIdxs'], [0])
         for r in small:
             self.assertEqual(r['coneIdxs'], [], 'a sliver must not inherit the cone')
+
+
+class AttributionTimingTests(unittest.TestCase):
+    """Attribution must not depend on which frames the pipeline downloaded.
+
+    Regression: `pipeline.frame_schedule` went hourly through the hindcast, which
+    moved the first look at cone1 of 20260907_58497 from +2.08 h to +5 min. Its
+    DP cloud had not cleared a radial cell yet (0 labelled cells in the wedge at
+    frame 0004, 8 at 0005, 12 at 0006), so a one-shot read marked a real CME
+    untraced and the monitor drew a density-inferred outline on top of the cloud
+    its co-directional partner already owned. The coarse cadence was never right
+    here either, only lucky: a cone injected just before a 3-hourly frame failed
+    identically.
+    """
+
+    def run_at(self, cones, schedule):
+        """Drive tracker + attributor over explicit (hours, painter) frames."""
+        tracker = BlobTracker(LON, LAT, RAD)
+        attributor = ConeAttributor(cones, LON, LAT, RAD, EARTH_LON)
+        vr = np.full((len(LON), len(LAT), len(RAD)), 1.0)
+        frames = []
+        for hours, paint in schedule:
+            dp = paint(np.zeros((len(LON), len(LAT), len(RAD))))
+            when = START + timedelta(hours=hours)
+            labels, tracked = tracker.update(dp, vr, when)
+            attributor.update(f'{int(hours):04d}', when, labels, tracked['regions'])
+            frames.append(tracked['regions'])
+        return attributor, frames
+
+    # Injected just after frame 0; its cloud is not labellable until ~1.5 h in.
+    CONE = staticmethod(lambda: cone(0.1, -4.0, -28.0, speed=690.0))
+
+    @staticmethod
+    def _paint(hours):
+        return (lambda dp: blob(dp, -4.0, -28.0)) if hours >= 2.0 else (lambda dp: dp)
+
+    def test_frame_moments_after_injection_does_not_abandon_the_cone(self):
+        hourly = [(h, self._paint(h)) for h in range(0, 7)]
+        attributor, frames = self.run_at([self.CONE()], hourly)
+        summary = attributor.summary()[0]
+        self.assertTrue(summary['trackIds'],
+                        'a look before the cloud exists must not settle the cone')
+        self.assertEqual(frames[-1][0]['coneIdxs'], [0])
+
+    def test_one_and_three_hourly_cadences_agree(self):
+        hourly = [(h, self._paint(h)) for h in range(0, 7)]
+        three = [(h, self._paint(h)) for h in (0, 3, 6)]
+        a1, f1 = self.run_at([self.CONE()], hourly)
+        a3, f3 = self.run_at([self.CONE()], three)
+        self.assertEqual(bool(a1.summary()[0]['trackIds']), bool(a3.summary()[0]['trackIds']))
+        self.assertEqual(f1[-1][0]['coneIdxs'], f3[-1][0]['coneIdxs'])
+
+    def test_search_stops_when_the_window_closes(self):
+        """The wait is bounded — it must not latch onto whatever turns up later."""
+        late = ATTRIBUTION_WINDOW_HOURS + 2.0
+        schedule = [(h, (lambda dp: blob(dp, -4.0, -28.0)) if h >= late else (lambda dp: dp))
+                    for h in range(0, int(late) + 2)]
+        attributor, frames = self.run_at([self.CONE()], schedule)
+        summary = attributor.summary()[0]
+        self.assertEqual(summary['trackIds'], [])
+        self.assertEqual(summary['note'], 'no tracked material in the injection footprint')
+        self.assertEqual(frames[-1][0]['coneIdxs'], [],
+                         'material appearing after the window is not this cone')
 
 
 if __name__ == '__main__':
