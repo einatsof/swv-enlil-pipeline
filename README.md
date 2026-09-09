@@ -232,6 +232,14 @@ frame failed the same way. The window is bounded so a cone cannot latch onto mat
 that merely drifts through the wedge much later; a spin-up cone arrives already past it
 and still resolves on frame 0.
 
+Each cone therefore carries **`tracking.tagged`** in `meta.json`: `true` when its
+material was found, `false` when the window closed with none (Enlil injected no tracer
+for it — the monitor's density fallback is gated on exactly this), and `null` when the
+question was not asked (no time/direction, or a truncated run that ended mid-window).
+⚠️ `false` is only trustworthy *because* the search waits; before that it also meant
+"we looked too early". Nothing in NOAA's `cone2bc.in` answers this — `ncld` is 2 on every
+run, including runs with a single cone, and 20260906_58495 tagged all 9 cones against it.
+
 Measured on that run, all nine cones resolved with **exactly one track in the footprint**
 — nothing to tie-break — and across 19 frames every slice-visible region (≥5 cells) had
 at least one cone, with **no cone ever appearing in two visible regions**.

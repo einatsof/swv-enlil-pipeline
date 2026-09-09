@@ -201,7 +201,8 @@ class ConeAttributor:
         for k, cone in enumerate(cones):
             when = cone.get('time')
             if when is None or cone.get('latitude') is None or cone.get('longitude') is None:
-                self.info[k] = {'frame': None, 'trackIds': [], 'note': 'cone has no time or direction'}
+                self.info[k] = {'frame': None, 'trackIds': [], 'tagged': None,
+                                'note': 'cone has no time or direction'}
                 continue
             self.pending.append((k, datetime.fromisoformat(when.replace('Z', '+00:00'))))
 
@@ -275,7 +276,12 @@ class ConeAttributor:
                 if not expired:
                     continue                  # still inside the window; look again
                 self.pending.remove(entry)
-                self.info[k] = {'frame': None, 'trackIds': [],
+                # `tagged: False` is a verdict about the MODEL, and it only became
+                # sayable once the search waited: it now means Enlil never put
+                # tracer material where this cone was injected, not that we looked
+                # too early. The monitor gates its density fallback on it — see
+                # `untracedCones()`. Anything else stays null rather than false.
+                self.info[k] = {'frame': None, 'trackIds': [], 'tagged': False,
                                 'note': 'no tracked material in the injection footprint'}
                 continue
             self.pending.remove(entry)
@@ -284,7 +290,7 @@ class ConeAttributor:
             self.tracks[k] = {best}
             # Kept for auditing: a low share or several tracks in one footprint is
             # the signature of an attribution that deserves a second look.
-            self.info[k] = {'frame': num, 'trackIds': [best], 'lastFrame': num,
+            self.info[k] = {'frame': num, 'trackIds': [best], 'lastFrame': num, 'tagged': True,
                             'footprintShare': round(float(counts.max()) / patch.size, 4),
                             'tracksInFootprint': int(len(ids))}
 
@@ -307,7 +313,7 @@ class ConeAttributor:
         # A cone still pending means the run ended inside its search window —
         # a different answer from "looked and found nothing", and only reachable
         # on a truncated run, since the last frame is rundate +120 h.
-        unresolved = {'frame': None, 'trackIds': [],
+        unresolved = {'frame': None, 'trackIds': [], 'tagged': None,
                       'note': 'run ended before the attribution window closed'}
         return [dict(self.info.get(k, unresolved),
                      lastTrackIds=sorted(self.tracks.get(k, [])))
