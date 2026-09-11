@@ -24,7 +24,10 @@ LABEL_DTYPE = np.uint16
 # 3: ConeAttributor waits for a cone's material instead of reading the first
 #    frame after injection and giving up — `coneIdxs` in blobs_<tag>.json changes
 #    meaning, and re-extracting a published run would otherwise reuse its URL.
-TRACKING_VERSION = 3
+# 4: ConeAttributor.backfill() carries each cone back to its track's frames from
+#    the injection onward, so `coneIdxs` describes the cloud rather than how far
+#    the extractor's loop had got when it wrote that frame.
+TRACKING_VERSION = 4
 
 
 @dataclass(frozen=True)

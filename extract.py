@@ -197,6 +197,7 @@ class ConeAttributor:
         self.earth_lon = earth_lon
         self.tracks = {}        # cone index -> live track ids carrying it
         self.info = {}          # cone index -> how it was attributed
+        self.injected = {}      # cone index -> injection time; outlives `pending`
         self.pending = []
         for k, cone in enumerate(cones):
             when = cone.get('time')
@@ -204,7 +205,10 @@ class ConeAttributor:
                 self.info[k] = {'frame': None, 'trackIds': [], 'tagged': None,
                                 'note': 'cone has no time or direction'}
                 continue
-            self.pending.append((k, datetime.fromisoformat(when.replace('Z', '+00:00'))))
+            cme_time = datetime.fromisoformat(when.replace('Z', '+00:00'))
+            # `pending` drains as cones resolve; backfill() still needs the time.
+            self.injected[k] = cme_time
+            self.pending.append((k, cme_time))
 
     def _footprint(self, cone, frame_time, cme_time):
         """Grid indices of the cone's wedge, from the inner boundary to its nose."""
@@ -297,6 +301,47 @@ class ConeAttributor:
         for record in records:
             record['coneIdxs'] = sorted(k for k, held in self.tracks.items()
                                         if record['trackId'] in held)
+
+    def backfill(self, frames):
+        """Carry each cone back over its own track's earlier frames.
+
+        ⚠️ **`coneIdxs` is written inside the frame loop but the manifest is
+        written after it**, so without this the field records *how far the
+        extractor had got*, not what the cloud carries. `update()` can only
+        credit cones resolved by the time its loop reached that frame, and
+        resolution deliberately lags the cloud: the tracker labels material as
+        soon as DP crosses the threshold, while attribution waits for the nose to
+        clear a radial cell (see the wait in `update`). Live on 20260910_58504,
+        track 1 was born at frame 0053 and cone 0 resolved at 0056 — three frames
+        (3 h) in which the widget drew a real cloud with no CME attached, no
+        usable card, and, for an Earth-bound CME, a ruler marker *beside* the
+        unnamed cloud because `hasRegionFor` was false. Every one of those frames
+        was serialized long after the answer was known.
+
+        Bounded below by the injection time, which is the whole subtlety: a cone
+        injected into material that already exists (three of nine on
+        20260906_58495) resolves to a track that predates it, and an unbounded
+        walk would have that cloud carrying the CME *before it erupted*.
+
+        Not bounded above, because it does not need to be. Track ids are never
+        reused, so `trackIds` — where the cone was identified, at injection —
+        cannot match a later, unrelated cloud; and from the attribution frame
+        onward `update()` has already credited the cone, so this is a no-op
+        there. Frames after a merge or split carry the cone through the tracker's
+        lineage under a *new* id, which this never touches.
+        """
+        stamps = [datetime.fromisoformat(f['time'].replace('Z', '+00:00')) for f in frames]
+        for k, info in self.info.items():
+            held = set(info.get('trackIds') or ())
+            cme_time = self.injected.get(k)
+            if not held or cme_time is None:
+                continue                      # never tagged, or no time to bound by
+            for frame, when in zip(frames, stamps):
+                if when < cme_time:
+                    continue
+                for record in frame['regions']:
+                    if record['trackId'] in held and k not in record['coneIdxs']:
+                        record['coneIdxs'] = sorted(record['coneIdxs'] + [k])
 
     def summary(self):
         """Per-cone attribution, positionally aligned with the run's cone list.
@@ -402,6 +447,9 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
         line[fi, :, 2] = sl_dp[ilon_earth]
 
     line.tofile(os.path.join(out_dir, 'line.bin'))
+    # Only now is every cone resolved, so `coneIdxs` can describe the cloud
+    # instead of the loop's progress. Must precede the manifest write below.
+    attributor.backfill(tracking_frames)
 
     meta = {
         'runId': run_id or os.path.basename(os.path.normpath(run_dir)),
@@ -447,7 +495,10 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
             'scope': '3d',
             # Regions carry `coneIdxs` (indices into `cmes`); cones carry
             # `tracking.trackIds`. Both sides of the join are published so a
-            # consumer never has to re-derive it from geometry.
+            # consumer never has to re-derive it from geometry. `coneIdxs` spans
+            # the cone's whole visible life, from the injection onward — not just
+            # the frames after `tracking.frame`, where it was identified (v4, see
+            # ConeAttributor.backfill).
             'coneAttribution': 'injection-footprint',
         },
         'credit': 'NOAA SWPC WSA-Enlil via the NOAA Open Data Dissemination Program',

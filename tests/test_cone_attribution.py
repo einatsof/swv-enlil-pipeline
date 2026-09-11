@@ -210,5 +210,77 @@ class AttributionTimingTests(unittest.TestCase):
                          'material appearing after the window is not this cone')
 
 
+class BackfillTests(unittest.TestCase):
+    """`coneIdxs` must describe the cloud, not the extractor's progress.
+
+    `update()` writes the field inside the frame loop, but the manifest is
+    serialized after it — so a cone that resolves late leaves its own earlier
+    frames claiming the cloud carries nothing. Live on 20260910_58504: track 1
+    born at frame 0053, cone 0 attributed at 0056, three frames of an unnamed
+    blob whose answer was already known when the file was written.
+    """
+
+    def run_frames(self, cones, painters, hours=3.0):
+        """Same drive as above, but keeping extract_run's manifest frame shape."""
+        tracker = BlobTracker(LON, LAT, RAD)
+        attributor = ConeAttributor(cones, LON, LAT, RAD, EARTH_LON)
+        vr = np.full((len(LON), len(LAT), len(RAD)), 1.0)
+        frames = []
+        for fi, paint in enumerate(painters):
+            dp = paint(np.zeros((len(LON), len(LAT), len(RAD))))
+            when = START + timedelta(hours=hours * fi)
+            num = f'{fi * 3:04d}'
+            labels, tracked = tracker.update(dp, vr, when)
+            attributor.update(num, when, labels, tracked['regions'])
+            frames.append({'frame': num, 'time': when.strftime('%Y-%m-%dT%H:%M:%SZ'), **tracked})
+        return attributor, frames
+
+    def test_the_cloud_carries_its_cone_from_the_frame_it_was_labelled(self):
+        # One radial cell takes 3.5 h at 300 km/s, so the attribution wait
+        # outlasts the frame on which the tracker first labels the cloud.
+        attributor, frames = self.run_frames(
+            [cone(0.5, 0.0, -40.0, speed=300.0)],
+            [lambda dp: dp,
+             lambda dp: blob(dp, 0.0, -40.0),
+             lambda dp: blob(dp, 0.0, -40.0)])
+        self.assertEqual(frames[1]['regions'][0]['coneIdxs'], [],
+                         'precondition: the lag this exists to repair')
+        self.assertEqual(frames[2]['regions'][0]['coneIdxs'], [0])
+        attributor.backfill(frames)
+        self.assertEqual(frames[1]['regions'][0]['coneIdxs'], [0])
+        self.assertEqual(frames[2]['regions'][0]['coneIdxs'], [0],
+                         'already credited by update(); must not double up')
+
+    def test_a_cone_is_not_carried_back_before_it_erupted(self):
+        """The bound that matters: a cone injected into material that predates it."""
+        cones = [cone(0.5, 0.0, -40.0), cone(3.5, 0.0, -40.0, speed=900.0)]
+        attributor, frames = self.run_frames(
+            cones,
+            [lambda dp: dp,
+             lambda dp: blob(dp, 0.0, -40.0),                 # 3 h: first cone only
+             lambda dp: blob(dp, 0.0, -40.0, k_to=4)])        # 6 h: second has joined
+        attributor.backfill(frames)
+        self.assertEqual(frames[1]['regions'][0]['coneIdxs'], [0],
+                         'the 3 h cloud predates the second cone (erupts at 3.5 h)')
+        self.assertEqual(frames[2]['regions'][0]['coneIdxs'], [0, 1])
+
+    def test_backfill_does_not_reach_an_unrelated_cloud(self):
+        cones = [cone(0.5, 0.0, -40.0), cone(0.5, 0.0, 80.0)]
+        attributor, frames = self.run_frames(
+            cones, [lambda dp: dp,
+                    lambda dp: blob(blob(dp, 0.0, -40.0), 0.0, 80.0)])
+        attributor.backfill(frames)
+        owners = {tuple(r['coneIdxs']) for r in frames[1]['regions']}
+        self.assertEqual(owners, {(0,), (1,)})
+
+    def test_a_cone_with_no_material_gains_nothing(self):
+        """`trackIds: []` stays an honest empty, not a nearest-cloud guess."""
+        attributor, frames = self.run_frames(
+            [cone(0.5, 40.0, 120.0)],
+            [lambda dp: dp, lambda dp: blob(dp, -30.0, -60.0)])
+        attributor.backfill(frames)
+        self.assertEqual(frames[1]['regions'][0]['coneIdxs'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

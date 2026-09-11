@@ -232,6 +232,22 @@ frame failed the same way. The window is bounded so a cone cannot latch onto mat
 that merely drifts through the wedge much later; a spin-up cone arrives already past it
 and still resolves on frame 0.
 
+⚠️ **`coneIdxs` describes the cloud, not the extractor's progress** (`backfill`,
+`TRACKING_VERSION` 4). The field is written inside the frame loop but the manifest is
+serialized after it, so a cone that resolves late used to leave its own earlier frames
+claiming the cloud carried nothing — even though the answer was known before the file
+was written. The wait above guarantees this lag: the tracker labels material as soon as
+DP crosses the threshold, while attribution waits for the nose to clear a radial cell.
+Live on `20260910_58504`, track 1 was born at frame `0053` and cone 0 resolved at `0056`
+— three frames (3 h) in which the monitor drew a real cloud with **no CME attached**, no
+usable tap card, and, for an Earth-bound CME, a ruler marker *beside* the unnamed cloud
+because `hasRegionFor` was false. A pass before the write carries each cone back over its
+own track's frames. It is **bounded below by the injection time**, which is the whole
+subtlety: a cone injected into material that already exists resolves to a track that
+predates it, and an unbounded walk would have that cloud carrying the CME *before it
+erupted*. No upper bound is needed — track ids are never reused, so `trackIds` cannot
+match a later unrelated cloud, and frames after the attribution already carry the cone.
+
 Each cone therefore carries **`tracking.tagged`** in `meta.json`: `true` when its
 material was found, `false` when the window closed with none (Enlil injected no tracer
 for it — the monitor's density fallback is gated on exactly this), and `null` when the
