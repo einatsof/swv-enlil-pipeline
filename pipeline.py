@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.request
 
 import boto3
@@ -87,6 +88,14 @@ KEEP_RUNS = 10
 # 9 buys 4 KB and costs nearly twice the CPU (7 s vs 4 s across a whole run).
 GZIP_LEVEL = 6
 DOWNLOAD_WORKERS = 8
+# Uploads get their own, much higher, concurrency. The two jobs are bound by
+# different things: a download is one 7.6 MB netCDF, so 8 streams already
+# saturate the link, while an upload is now a ~23 KB gzipped object whose cost is
+# almost entirely the round trip. Publishing volumes took the object count from
+# 340 to 566, and at 8 workers those 226 extra PUTs are ~28 more serial rounds —
+# which is where the run time went, not into the gzip (0.8 s) or the extra
+# quantisation (0.85 s). Bytes actually went DOWN, 41 MB to 12.8 MB.
+UPLOAD_WORKERS = 24
 
 RUN_PREFIX_RE = re.compile(r'^wsa_enlil\.(\d{8})(?:_(\d+))?/$')
 PV_FRAME_RE = re.compile(r'/pv-tim\.(\d+)\.nc$')
@@ -332,7 +341,7 @@ def upload_artifacts(r2, out_dir, run_id):
         r2.put_object(Bucket=R2_BUCKET, Key=dest, Body=body,
                       ContentType='application/octet-stream',
                       ContentEncoding='gzip')
-    with concurrent.futures.ThreadPoolExecutor(DOWNLOAD_WORKERS) as ex:
+    with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as ex:
         list(ex.map(put, [n for n in names if n != 'meta.json']))
     put('meta.json')
     # latest.json LAST: it is the pointer the worker serves, so everything it
@@ -435,11 +444,23 @@ def main():
         print('up to date — nothing to do')
         return
 
+    # Per-phase timings. Without these, "why did this run take longer?" can only
+    # be answered by reconstructing it from first principles afterwards — which
+    # is exactly what happened when volumes landed and the run went 40 s -> 85 s.
+    # One line in the log settles it next time.
+    timings = {}
+    def phase(name, fn, *a, **kw):
+        t0 = time.monotonic()
+        try:
+            return fn(*a, **kw)
+        finally:
+            timings[name] = time.monotonic() - t0
+
     with tempfile.TemporaryDirectory(prefix='enlil_') as tmp:
         raw = os.path.join(tmp, 'raw')
         out = args.keep_out or os.path.join(tmp, 'out')
         os.makedirs(raw)
-        download_run(s3, run, raw)
+        phase('download', download_run, s3, run, raw)
         # Volumes ON (2026-09-18): the monitor's transit section is going 3D —
         # top-down at rest (unchanged from today), tilt to reveal latitude
         # structure. The ecliptic slice it draws now keeps only ~7% of a cloud's
@@ -452,13 +473,16 @@ def main():
         # `prune_runs` retains. The client stages it — 2D first, then the
         # now-frame volume prefetched on idle (169 KB, the only fetch needed for
         # tilt to work), then the sweep frames on first tilt.
-        extract_run(raw, out, run_id=run['runId'], volumes=True)
+        phase('extract', extract_run, raw, out, run_id=run['runId'], volumes=True)
 
         if args.dry_run:
             print('dry run — skipping upload/prune')
+            print('timings: ' + '  '.join(f'{k} {v:.1f}s' for k, v in timings.items()))
             return
-        upload_artifacts(r2, out, run['runId'])
-        prune_runs(r2)
+        phase('upload', upload_artifacts, r2, out, run['runId'])
+        phase('prune', prune_runs, r2)
+    print('timings: ' + '  '.join(f'{k} {v:.1f}s' for k, v in timings.items())
+          + f'  total {sum(timings.values()):.1f}s')
     print('done')
 
 
