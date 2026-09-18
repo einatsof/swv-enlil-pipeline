@@ -26,7 +26,6 @@ R2 credentials (upload/prune only), from environment / Actions secrets:
 
 import argparse
 import concurrent.futures
-import gzip
 import json
 import os
 import re
@@ -84,17 +83,14 @@ TAIL_STRIDE = 3
 # 45 frames, and describe_run() accepts anything from 20 up.
 FALLBACK_STRIDE = 3
 KEEP_RUNS = 10
-# gzip level for the frame binaries. 6 over 9 deliberately: on the densest field
-# 9 buys 4 KB and costs nearly twice the CPU (7 s vs 4 s across a whole run).
-GZIP_LEVEL = 6
 DOWNLOAD_WORKERS = 8
 # Uploads get their own, much higher, concurrency. The two jobs are bound by
 # different things: a download is one 7.6 MB netCDF, so 8 streams already
-# saturate the link, while an upload is now a ~23 KB gzipped object whose cost is
-# almost entirely the round trip. Publishing volumes took the object count from
-# 340 to 566, and at 8 workers those 226 extra PUTs are ~28 more serial rounds —
-# which is where the run time went, not into the gzip (0.8 s) or the extra
-# quantisation (0.85 s). Bytes actually went DOWN, 41 MB to 12.8 MB.
+# saturate the link, while an upload is a small object whose cost is almost
+# entirely the round trip. Publishing volumes took the object count from 340 to
+# 566, and at 8 workers those 226 extra PUTs were ~28 more serial rounds — which
+# is where the run time went (40 s -> 85 s), not into the extra quantisation
+# (0.85 s) or the file writes (0.31 s). Raising this took it back to 42 s.
 UPLOAD_WORKERS = 24
 
 RUN_PREFIX_RE = re.compile(r'^wsa_enlil\.(\d{8})(?:_(\d+))?/$')
@@ -304,43 +300,41 @@ def download_run(s3, run, dest):
 
 
 def upload_artifacts(r2, out_dir, run_id):
-    """Upload a run's artifacts, gzipping the binaries on the way in.
+    """Upload a run's artifacts, uncompressed.
 
-    ⚠️ **Cloudflare does not compress `application/octet-stream`.** Verified
-    against the live worker: a request carrying `Accept-Encoding: gzip, br` gets
-    the `.bin` files back with no `content-encoding` at all, while the `.json`
-    ones come back `br`. So every frame binary was going over the wire raw.
+    ⚠️ **DO NOT pre-compress these and set `ContentEncoding` on the object.**
+    It was tried on 2026-09-18 and it broke the transit section in production.
 
-    That is worth a lot here, because the tracer fields are mostly empty:
-    `voldp` is 92.4% exact zeros and gzips to **6%** of its size (168.8 KB ->
-    5.5 KB), `sldp` to 300 bytes from 5,760. Even the dense ambient field
-    (`vol`, 1.2% zeros) still halves. Level 6 rather than 9: it gives up 4 KB on
-    the densest file and saves half the CPU — about 4 s per run rather than 7.
+    The attraction was real: Cloudflare does not compress
+    `application/octet-stream` (verified — `.bin` files come back with no
+    `content-encoding` while their `.json` siblings come back `br`), and these
+    fields are mostly empty, so `voldp` gzips to 6% of its size and `sldp` to
+    300 bytes from 5,760, taking a whole run from 20.7 MB to 6.5 MB.
 
-    The object carries `ContentEncoding` in its own metadata, so the worker can
-    simply replay it with `writeHttpMetadata` instead of guessing from the
-    filename, and runs uploaded before this change keep serving as they always
-    did.
+    What actually happens is that **Cloudflare re-compresses the response.**
+    Caught by gunzipping the live body twice: a browser-like request returned
+    `gzip(gzip(data))` — 4,387 bytes that decode to 4,364 bytes of *gzip*, which
+    only then decode to the real 5,760. The browser peels one layer and hands
+    the widget raw gzip bytes, `selectFrame`'s `byteLength !== n` check throws,
+    the catch keeps the previous frame, and the field silently stops updating.
+    Clients that send no `Accept-Encoding` hit the mirror image: Cloudflare
+    strips the header but not the compression, so they get gzip bytes labelled
+    as raw. Note `vary: Origin` — not `Accept-Encoding` — so the edge caches one
+    variant and hands it to everybody.
 
-    ⚠️ **JSON is deliberately NOT pre-compressed.** Cloudflare already brotlis it
-    at the edge, and more importantly these are read by non-browser clients —
-    this pipeline's own idempotency check uses `urllib`, which neither negotiates
-    nor decodes gzip. Pre-compressing them would serve bytes it cannot read.
+    A manual `Content-Encoding` on a Workers response fights the platform's own
+    compression layer, and the platform wins. If this is ever worth revisiting,
+    the safe shape is to leave HTTP alone entirely: serve the bytes as opaque
+    octet-stream and have the WIDGET decompress with `DecompressionStream`, so
+    no intermediary has an opinion about the encoding.
     """
     names = sorted(os.listdir(out_dir))
     print(f'uploading {len(names)} artifacts to r2://{R2_BUCKET}/enlil/{run_id}/')
     def put(name, key=None):
-        path = os.path.join(out_dir, name)
-        dest = key or f'enlil/{run_id}/{name}'
-        if name.endswith('.json'):
-            r2.upload_file(path, R2_BUCKET, dest,
-                           ExtraArgs={'ContentType': 'application/json'})
-            return
-        with open(path, 'rb') as fh:
-            body = gzip.compress(fh.read(), GZIP_LEVEL)
-        r2.put_object(Bucket=R2_BUCKET, Key=dest, Body=body,
-                      ContentType='application/octet-stream',
-                      ContentEncoding='gzip')
+        ct = 'application/json' if name.endswith('.json') else 'application/octet-stream'
+        r2.upload_file(os.path.join(out_dir, name), R2_BUCKET,
+                       key or f'enlil/{run_id}/{name}',
+                       ExtraArgs={'ContentType': ct})
     with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as ex:
         list(ex.map(put, [n for n in names if n != 'meta.json']))
     put('meta.json')
