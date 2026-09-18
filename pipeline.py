@@ -13,7 +13,8 @@ Steps:
      falls back to the public worker endpoint.
   3. Download the pv-tim frames frame_schedule() selects (~113 files ≈ 860 MB)
      plus metadata.json and evo.earth.nc, in parallel.
-  4. extract.py → u8 artifacts (volumes off until the 3D page needs them).
+  4. extract.py → u8 artifacts, 3D volumes included (the monitor's transit
+     section tilts to reveal them; +39 MB/run, ~391 MB across KEEP_RUNS).
   5. Upload to R2 enlil/<runId>/…, then write enlil/latest.json last — the
      worker serves latest.json, so a failed upload can't leave it pointing at
      a half-uploaded run.
@@ -25,6 +26,7 @@ R2 credentials (upload/prune only), from environment / Actions secrets:
 
 import argparse
 import concurrent.futures
+import gzip
 import json
 import os
 import re
@@ -81,6 +83,9 @@ TAIL_STRIDE = 3
 # 45 frames, and describe_run() accepts anything from 20 up.
 FALLBACK_STRIDE = 3
 KEEP_RUNS = 10
+# gzip level for the frame binaries. 6 over 9 deliberately: on the densest field
+# 9 buys 4 KB and costs nearly twice the CPU (7 s vs 4 s across a whole run).
+GZIP_LEVEL = 6
 DOWNLOAD_WORKERS = 8
 
 RUN_PREFIX_RE = re.compile(r'^wsa_enlil\.(\d{8})(?:_(\d+))?/$')
@@ -193,6 +198,21 @@ def find_official_run(s3, number):
     return None
 
 
+def find_run_by_id(s3, run_id):
+    """The prefix for an exact runId (`20260913_58512`), or None.
+
+    Used by `--run` and by the `--force` fallback. Deliberately matches the
+    whole id rather than the run number: the number alone is ambiguous if NOAA
+    ever republishes one under a different date.
+    """
+    want = f'wsa_enlil.{run_id}/'
+    for prefix in reversed(list_run_prefixes(s3)):
+        if prefix == want:
+            return describe_run(s3, prefix)
+    print(f'run {run_id} is not in the bucket')
+    return None
+
+
 def find_newest_pv_run(s3):
     """Newest run with pv-tim files, official or not — `--allow-unofficial` only.
     Walks back a few in case the newest prefix is still being written."""
@@ -275,13 +295,43 @@ def download_run(s3, run, dest):
 
 
 def upload_artifacts(r2, out_dir, run_id):
+    """Upload a run's artifacts, gzipping the binaries on the way in.
+
+    ⚠️ **Cloudflare does not compress `application/octet-stream`.** Verified
+    against the live worker: a request carrying `Accept-Encoding: gzip, br` gets
+    the `.bin` files back with no `content-encoding` at all, while the `.json`
+    ones come back `br`. So every frame binary was going over the wire raw.
+
+    That is worth a lot here, because the tracer fields are mostly empty:
+    `voldp` is 92.4% exact zeros and gzips to **6%** of its size (168.8 KB ->
+    5.5 KB), `sldp` to 300 bytes from 5,760. Even the dense ambient field
+    (`vol`, 1.2% zeros) still halves. Level 6 rather than 9: it gives up 4 KB on
+    the densest file and saves half the CPU — about 4 s per run rather than 7.
+
+    The object carries `ContentEncoding` in its own metadata, so the worker can
+    simply replay it with `writeHttpMetadata` instead of guessing from the
+    filename, and runs uploaded before this change keep serving as they always
+    did.
+
+    ⚠️ **JSON is deliberately NOT pre-compressed.** Cloudflare already brotlis it
+    at the edge, and more importantly these are read by non-browser clients —
+    this pipeline's own idempotency check uses `urllib`, which neither negotiates
+    nor decodes gzip. Pre-compressing them would serve bytes it cannot read.
+    """
     names = sorted(os.listdir(out_dir))
     print(f'uploading {len(names)} artifacts to r2://{R2_BUCKET}/enlil/{run_id}/')
     def put(name, key=None):
-        ct = 'application/json' if name.endswith('.json') else 'application/octet-stream'
-        r2.upload_file(os.path.join(out_dir, name), R2_BUCKET,
-                       key or f'enlil/{run_id}/{name}',
-                       ExtraArgs={'ContentType': ct})
+        path = os.path.join(out_dir, name)
+        dest = key or f'enlil/{run_id}/{name}'
+        if name.endswith('.json'):
+            r2.upload_file(path, R2_BUCKET, dest,
+                           ExtraArgs={'ContentType': 'application/json'})
+            return
+        with open(path, 'rb') as fh:
+            body = gzip.compress(fh.read(), GZIP_LEVEL)
+        r2.put_object(Bucket=R2_BUCKET, Key=dest, Body=body,
+                      ContentType='application/octet-stream',
+                      ContentEncoding='gzip')
     with concurrent.futures.ThreadPoolExecutor(DOWNLOAD_WORKERS) as ex:
         list(ex.map(put, [n for n in names if n != 'meta.json']))
     put('meta.json')
@@ -314,7 +364,11 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='download + extract only; no R2 access, no credentials needed')
     ap.add_argument('--force', action='store_true',
-                    help='process even if the worker already serves this run')
+                    help='re-extract even if the worker already serves this run; if SWPC names '
+                         'a run the bucket does not have, re-extract the published one')
+    ap.add_argument('--run', default=None,
+                    help='extract this exact runId (e.g. 20260913_58512) instead of resolving '
+                         'the operational one — for backfilling a specific run')
     ap.add_argument('--keep-out', default=None,
                     help='write artifacts here instead of a temp dir (implies inspectable output)')
     ap.add_argument('--allow-unofficial', action='store_true',
@@ -324,31 +378,59 @@ def main():
     args = ap.parse_args()
 
     s3 = noaa_client()
-    if args.allow_unofficial:
-        run = find_newest_pv_run(s3)
-        print(f'newest NOAA run (UNOFFICIAL): {run["runId"]} ({len(run["pvtims"])} pv frames)')
-    else:
-        number = official_run_number()
-        run = find_official_run(s3, number) if number else None
-        if not run:
-            # Deliberately not falling back to the newest prefix: publishing an
-            # analysis run would replace the whole heliosphere with one CME.
-            # Keeping the last good run is always the safer failure.
-            print('could not resolve the operational run — leaving the published run in place')
-            return
-        print(f'SWPC operational run: {run["runId"]} ({len(run["pvtims"])} pv frames)')
 
-    # Build the R2 client up front (not just before upload) so a bad/missing
-    # credential fails in seconds rather than after a 435 MB download.
+    # Build the R2 client and read the published run BEFORE resolving anything.
+    # Credentials still fail in seconds rather than after a 435 MB download, and
+    # the published id is now available to the --force fallback below.
     have_creds = all(os.environ.get(k) for k in
                      ('R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'))
     if not have_creds and not args.dry_run:
         raise SystemExit('R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY '
                          'must be set (or pass --dry-run)')
     r2 = r2_client() if have_creds else None
-
     current = published_run_id(r2) if r2 else published_run_id_via_worker()
     print(f'currently published: {current}')
+
+    if args.allow_unofficial:
+        run = find_newest_pv_run(s3)
+        print(f'newest NOAA run (UNOFFICIAL): {run["runId"]} ({len(run["pvtims"])} pv frames)')
+    elif args.run:
+        run = find_run_by_id(s3, args.run)
+        if not run:
+            raise SystemExit(f'--run {args.run}: not in the bucket, or has no pv-ready data')
+        print(f'explicit run: {run["runId"]} ({len(run["pvtims"])} pv frames)')
+    else:
+        number = official_run_number()
+        run = find_official_run(s3, number) if number else None
+        if not run and args.force and current:
+            # ⚠️ **--force could not reach this before, and that was the bug.**
+            # The run-resolution exit sits ahead of the up-to-date check, so a
+            # force run still died here — which is exactly when you want it to
+            # work: re-extracting the run already being served, to pick up new
+            # artifacts (volumes, gzip) without waiting on NOAA.
+            #
+            # It happens often. NOAA's public S3 mirror lags SWPC's own manifest
+            # by days: on 2026-09-18 SWPC named 58522 while the bucket held
+            # nothing past 58515, so the pipeline had been exiting here since the
+            # 14th and the published run was five days stale.
+            #
+            # Safe by construction: it can only ever re-extract the run ALREADY
+            # published, so it cannot swap the product for an analysis run the
+            # way a "newest prefix" fallback would. `--allow-unofficial` is still
+            # the only path that changes which run is served without SWPC saying so.
+            run = find_run_by_id(s3, current)
+            if run:
+                print(f'--force: SWPC names {number}, which is not in the bucket; '
+                      f're-extracting the published run {current} instead')
+        if not run:
+            # Deliberately not falling back to the newest prefix: publishing an
+            # analysis run would replace the whole heliosphere with one CME.
+            # Keeping the last good run is always the safer failure.
+            print('could not resolve the operational run — leaving the published run in place')
+            return
+        if not args.force:
+            print(f'SWPC operational run: {run["runId"]} ({len(run["pvtims"])} pv frames)')
+
     if current == run['runId'] and not args.force:
         print('up to date — nothing to do')
         return
