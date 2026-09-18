@@ -358,7 +358,19 @@ def main():
         out = args.keep_out or os.path.join(tmp, 'out')
         os.makedirs(raw)
         download_run(s3, run, raw)
-        extract_run(raw, out, run_id=run['runId'], volumes=False)
+        # Volumes ON (2026-09-18): the monitor's transit section is going 3D —
+        # top-down at rest (unchanged from today), tilt to reveal latitude
+        # structure. The ecliptic slice it draws now keeps only ~7% of a cloud's
+        # cells (measured on run 20260913_58512: 100 of 1,339 for the merged
+        # two-cone cloud), so the other 93% is exactly what tilting exposes.
+        #
+        # Cost is modest and lands entirely on R2, not on the default page load:
+        # a volume frame is 90*30*64 = 169 KB against the slice's 5.6 KB, so
+        # ~39 MB per run for `vol` + `voldp` and ~390 MB across the 10 runs
+        # `prune_runs` retains. The client stages it — 2D first, then the
+        # now-frame volume prefetched on idle (169 KB, the only fetch needed for
+        # tilt to work), then the sweep frames on first tilt.
+        extract_run(raw, out, run_id=run['runId'], volumes=True)
 
         if args.dry_run:
             print('dry run — skipping upload/prune')
