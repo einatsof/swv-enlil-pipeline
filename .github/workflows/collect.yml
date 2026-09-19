@@ -26,6 +26,23 @@ on:
         description: re-process even if the worker already serves the newest run
         type: boolean
         default: false
+      run_id:
+        # Escape hatch for the one failure the --force fallback cannot fix.
+        # --force re-extracts the run ALREADY PUBLISHED, so it is useless once
+        # that run's forecast horizon has expired: a run covers rundate -48 h to
+        # +120 h, and when SWPC names a run NOAA's S3 mirror does not have yet,
+        # the pipeline exits and the published run simply ages out from under the
+        # site. Live on 2026-09-19: SWPC named 58523, the bucket held nothing
+        # past 58519, and published run 20260913_58512 ran out of frames at
+        # 2026-09-18T21:00Z — so the monitor's transit section lost its field.
+        #
+        # ⚠️ This BYPASSES official_run_number(), the guard that keeps a
+        # single-CME analysis run from replacing the whole heliosphere. Check the
+        # cone list before using it — an operational run carries the day's CMEs,
+        # an analysis run exactly one. Leave blank for normal operation.
+        description: extract this exact runId (e.g. 20260915_58519) instead of the operational one
+        type: string
+        default: ''
 
 # A slow download must never overlap the next tick's run.
 concurrency:
@@ -50,4 +67,7 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python pipeline.py ${{ inputs.force && '--force' || '' }}
+        run: >-
+          python pipeline.py
+          ${{ inputs.force && '--force' || '' }}
+          ${{ inputs.run_id && format('--run {0}', inputs.run_id) || '' }}
