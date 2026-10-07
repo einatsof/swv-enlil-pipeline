@@ -72,6 +72,20 @@ def quantize_dp(a):
     return np.clip(np.sqrt(np.clip(a, 0, DP_MAX) / DP_MAX) * 255.0, 0, 255).astype(np.uint8)
 
 
+def field_scales():
+    """The u8 encodings, as published in meta.json. Shared with suball.py so a
+    cone run and an ambient run can never disagree on what a byte means — the
+    monitor draws both with one colour ramp."""
+    return {
+        'ratio': {'encoding': 'log2', 'min': RATIO_LOG2[0], 'max': RATIO_LOG2[1]},
+        'vr': {'encoding': 'linear', 'min': VR_SCALE[0], 'max': VR_SCALE[1], 'units': 'km/s'},
+        'dp': {'encoding': 'sqrt', 'max': DP_MAX},
+    }
+
+
+LINE_LAYOUT = ['frame', 'rad', ['ratio', 'vr', 'dp']]
+
+
 def frame_number(path):
     m = re.search(r'pv-tim\.(\d+)\.nc$', os.path.basename(path))
     return m.group(1) if m else None
@@ -453,6 +467,12 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
 
     meta = {
         'runId': run_id or os.path.basename(os.path.normpath(run_dir)),
+        # Which product this is. The worker routes on it (cone runs feed both the
+        # monitor and the /enlil 3D page; ambient runs, from suball.py, only the
+        # monitor), and consumers check `capabilities` rather than guessing from
+        # which fields happen to be present.
+        'kind': 'cone',
+        'capabilities': {'volumes': bool(volumes), 'tracking': True},
         'generated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         # NOAA's issue time. Published so a consumer can tell hindcast frames
         # from forecast ones without assuming the 48 h split.
@@ -468,13 +488,9 @@ def extract_run(run_dir, out_dir, run_id=None, volumes=True, tracking_config=Non
         'layout': {
             'slice': ['lon', 'rad'],
             'vol': ['lon', 'lat', 'rad'],
-            'line': ['frame', 'rad', ['ratio', 'vr', 'dp']],
+            'line': LINE_LAYOUT,
         },
-        'scales': {
-            'ratio': {'encoding': 'log2', 'min': RATIO_LOG2[0], 'max': RATIO_LOG2[1]},
-            'vr': {'encoding': 'linear', 'min': VR_SCALE[0], 'max': VR_SCALE[1], 'units': 'km/s'},
-            'dp': {'encoding': 'sqrt', 'max': DP_MAX},
-        },
+        'scales': field_scales(),
         'densityIsR2Scaled': True,
         'ambientEcliptic': [round(float(v), 4) for v in ambient[ecl]],
         'earth': {'lon': earth_lon, 'lat': earth_lat, 'lonIndex': ilon_earth},

@@ -3,56 +3,62 @@ name: collect
 on:
   schedule:
     # Hourly, offset from the top of the hour (GitHub load spikes at :00 make
-    # on-the-hour crons the least reliable slot). The pipeline is idempotent — a
-    # tick with no newly-promoted run costs ~3 s of network (manifest fetch +
-    # two list calls) and exits.
+    # on-the-hour crons the least reliable slot). Both products are idempotent —
+    # a tick with nothing new costs a few seconds of listing and exits.
     #
-    # Polling rate does NOT drive cost: the 435 MB download happens once per
-    # *operational run SWPC promotes*, ~1–2/day, and no amount of extra polling
-    # creates more of them. What hourly buys is latency. SWPC promotes a run
-    # ~1.3 h after it is created (58491: created 22:10, animation frames
-    # published 23:36), and that lag is not ours to remove — so the polling
-    # interval is the only part of the staleness we control. At 3 h the worst
-    # case was ~4.3 h from run creation to the site; hourly halves it.
-    #
-    # It does slightly raise download count: a 3-hourly tick can step over an
-    # operational run that was superseded inside the window, and hourly catches
-    # both. Bounded by the promotion rate (~1 extra/day at most), and catching
-    # it is the correct behaviour anyway.
+    # Polling rate does NOT drive cost: the cone download (~860 MB) happens once
+    # per *operational run SWPC promotes*, ~1–2/day, and the ambient download
+    # (~131 MB) once per day. What hourly buys is latency, and — for ambient —
+    # ~40 chances to catch each run inside NOMADS' ~2-day retention, which is
+    # what makes skipped or hours-late GitHub ticks harmless.
     - cron: '23 * * * *'
+    # Monthly keepalive (see the job). Must stay distinct from the hourly cron:
+    # jobs tell the two triggers apart by this exact string.
+    - cron: '7 5 1 * *'
   workflow_dispatch:
     inputs:
+      target:
+        description: which job(s) to run
+        type: choice
+        options: [both, cone, ambient, health, keepalive]
+        default: both
       force:
-        description: re-process even if the worker already serves the newest run
+        description: re-process even if the newest run is already published
         type: boolean
         default: false
       run_id:
-        # Escape hatch for the one failure the --force fallback cannot fix.
-        # --force re-extracts the run ALREADY PUBLISHED, so it is useless once
-        # that run's forecast horizon has expired: a run covers rundate -48 h to
-        # +120 h, and when SWPC names a run NOAA's S3 mirror does not have yet,
-        # the pipeline exits and the published run simply ages out from under the
-        # site. Live on 2026-09-19: SWPC named 58523, the bucket held nothing
-        # past 58519, and published run 20260913_58512 ran out of frames at
-        # 2026-09-18T21:00Z — so the monitor's transit section lost its field.
+        # Cone only. Escape hatch for the one failure the --force fallback cannot
+        # fix: --force re-extracts the run ALREADY PUBLISHED, so it is useless
+        # once that run's forecast horizon has expired. Live on 2026-09-19: SWPC
+        # named 58523, the bucket held nothing past 58519, and published run
+        # 20260913_58512 ran out of frames at 2026-09-18T21:00Z.
         #
         # ⚠️ This BYPASSES official_run_number(), the guard that keeps a
         # single-CME analysis run from replacing the whole heliosphere. Check the
         # cone list before using it — an operational run carries the day's CMEs,
         # an analysis run exactly one. Leave blank for normal operation.
-        description: extract this exact runId (e.g. 20260915_58519) instead of the operational one
+        description: cone — extract this exact runId (e.g. 20260915_58519) instead of the operational one
         type: string
         default: ''
+      horizon_hours:
+        description: health — required coverage beyond now, in hours (set huge to test the failure path)
+        type: string
+        default: '12'
 
-# A slow download must never overlap the next tick's run.
-concurrency:
-  group: collect
-  cancel-in-progress: false
+# No workflow-level concurrency: each product has its own group, so a slow cone
+# download (~860 MB) never holds up the ambient job, and each still never
+# overlaps itself across ticks.
 
 jobs:
-  collect:
+  cone:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '23 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.target == 'both' || inputs.target == 'cone'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: collect-cone
+      cancel-in-progress: false
     steps:
       # v5 / v6 are the first majors that target Node 24. Older tags still run,
       # but the runner forces them onto Node 24 and warns every time.
@@ -62,12 +68,80 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: run pipeline
+      - name: collect cone run (NOAA S3)
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: >-
-          python pipeline.py
+          python pipeline.py cone
           ${{ inputs.force && '--force' || '' }}
           ${{ inputs.run_id && format('--run {0}', inputs.run_id) || '' }}
+
+  ambient:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '23 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.target == 'both' || inputs.target == 'ambient'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: collect-ambient
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: collect ambient run (NCEP NOMADS)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python pipeline.py ambient ${{ inputs.force && '--force' || '' }}
+
+  # The one job that goes RED when the site is about to lose its field. Every
+  # "nothing new" path above exits 0 by design, so a green collect run says
+  # nothing about whether the monitor has data — this does, and its failure is
+  # what triggers GitHub's email.
+  health:
+    needs: [cone, ambient]
+    if: >-
+      always() && (
+        (github.event_name == 'schedule' && github.event.schedule == '23 * * * *') ||
+        (github.event_name == 'workflow_dispatch' && inputs.target != 'keepalive')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: check that a published run covers the near future
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python pipeline.py health --horizon-hours ${{ inputs.horizon_hours || '12' }}
+
+  # GitHub disables scheduled workflows in public repos after 60 days with no
+  # repository activity — silently, and this repo can go months without a
+  # commit while the pipeline does its job. Re-enabling via the API keeps the
+  # schedule alive without making commits.
+  keepalive:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '7 5 1 * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'keepalive')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: re-enable this workflow's schedule
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/collect.yml/enable"

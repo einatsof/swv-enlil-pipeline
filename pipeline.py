@@ -1,26 +1,46 @@
 """
-End-to-end WSA-Enlil pipeline: NOAA S3 → artifacts → Cloudflare R2.
+End-to-end WSA-Enlil pipeline → Cloudflare R2. Two products, one command each:
+
+  python pipeline.py cone      the operational CME ("cone") run, NOAA S3 pv-tim
+  python pipeline.py ambient   the daily no-CME ("ambient") run, NCEP NOMADS suball
+  python pipeline.py health    fail loudly if no published run covers the near future
 
 Designed for GitHub Actions (cron + manual dispatch), runnable locally with
 --dry-run (everything except upload/prune; needs no credentials).
 
-Steps:
+R2 layout — each product in its own folder with its own pointer, so the /enlil
+3D page can only ever be handed a cone run (it needs volumes), while the worker
+picks from both for the monitor's transit field:
+
+  enlil/cone/latest.json      enlil/cone/<YYYYMMDD_NNNNN>/…    keep KEEP['cone']
+  enlil/ambient/latest.json   enlil/ambient/amb_<YYYYMMDD>_<HH>/…  keep KEEP['ambient']
+
+The runId pattern alone says which folder a run lives in (RUN_ID_RE) — the
+worker resolves frame URLs the same way, so public URLs never name a folder.
+
+cone:
   1. Resolve the run SWPC itself publishes (its public animation names it) and
      find that prefix on s3://noaa-wsa-enlil-pds. **Not the newest prefix** —
      the bucket also carries single-CME analysis runs; see official_run_number().
-  2. Idempotency: read enlil/latest.json straight from R2 (the source of truth
-     the worker merely serves). Same run ⇒ exit 0. A credential-free --dry-run
-     falls back to the public worker endpoint.
+  2. Idempotency: read enlil/cone/latest.json straight from R2 (the source of
+     truth the worker merely serves). Same run ⇒ exit 0. A credential-free
+     --dry-run falls back to the public worker endpoint.
   3. Download the pv-tim frames frame_schedule() selects (~113 files ≈ 860 MB)
      plus metadata.json and evo.earth.nc, in parallel.
-  4. extract.py → u8 artifacts, 3D volumes included (the monitor's transit
-     section tilts to reveal them; +39 MB/run, ~391 MB across KEEP_RUNS).
-  5. Upload to R2 enlil/<runId>/…, then write enlil/latest.json last — the
-     worker serves latest.json, so a failed upload can't leave it pointing at
-     a half-uploaded run.
-  6. Prune R2 to the newest KEEP_RUNS run prefixes.
+  4. extract.py → u8 artifacts, 3D volumes included.
+  5. Upload to enlil/cone/<runId>/…, the pointer written last — a failed upload
+     can't leave it pointing at a half-uploaded run.
+  6. Prune enlil/cone/ to the newest KEEP['cone'] runs.
 
-R2 credentials (upload/prune only), from environment / Actions secrets:
+ambient (see suball.py / nomads.py for why it exists and what was verified):
+  1. Find the newest `mrid00000000.suball.nc` on NOMADS (~2-day retention).
+  2. Idempotency on its Last-Modified, BEFORE downloading 131 MB; skip files
+     modified < 15 min ago (may still be being written).
+  3. Refuse unless the run's enlil.in says `ncmes=0`.
+  4. suball.py → slice artifacts on the cone runs' exact grid, every frame.
+  5. Upload to enlil/ambient/<runId>/…, pointer last; prune to KEEP['ambient'].
+
+R2 credentials (upload/prune/health), from environment / Actions secrets:
   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 """
 
@@ -33,12 +53,15 @@ import sys
 import tempfile
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
 
+import nomads
 from extract import extract_run
+from suball import extract_ambient_run
 
 NOAA_BUCKET = 'noaa-wsa-enlil-pds'
 R2_BUCKET = os.environ.get('R2_BUCKET', 'spaceweatherviz-textures')
@@ -82,7 +105,17 @@ TAIL_STRIDE = 3
 # boundaries would land somewhere else entirely. 20260905_58489 published only
 # 45 frames, and describe_run() accepts anything from 20 up.
 FALLBACK_STRIDE = 3
-KEEP_RUNS = 10
+# Runs retained per product. Cone runs are kept for the /enlil page's history
+# and are large (~40 MB with volumes); an ambient run is ~4 MB and only the
+# newest is ever served — the second is a margin against a bad publish.
+KEEP = {'cone': 10, 'ambient': 2}
+R2_FOLDER = {'cone': 'enlil/cone/', 'ambient': 'enlil/ambient/'}
+# The runId says which product it is. Kept in lockstep with the worker's
+# lib/enlilRuns.js, which routes frame URLs by the same patterns.
+RUN_ID_RE = {
+    'cone': re.compile(r'^\d{8}_\d+$'),
+    'ambient': re.compile(r'^amb_\d{8}_\d{2}$'),
+}
 DOWNLOAD_WORKERS = 8
 # Uploads get their own, much higher, concurrency. The two jobs are bound by
 # different things: a download is one 7.6 MB netCDF, so 8 streams already
@@ -228,20 +261,30 @@ def find_newest_pv_run(s3):
     raise SystemExit('no usable pv-ready run found in the newest 6 prefixes')
 
 
-def published_run_id(r2):
-    """Which run is currently published, from R2 — the source of truth the
-    worker only serves. Reading it here (rather than over HTTP) keeps the check
-    authoritative and independent of the API's availability or edge caching."""
+def pointer_key(kind):
+    return f'{R2_FOLDER[kind]}latest.json'
+
+
+def published_meta(r2, kind):
+    """The currently published meta for a product, from R2 — the source of truth
+    the worker only serves. Reading it here (rather than over HTTP) keeps the
+    check authoritative and independent of the API's availability or edge
+    caching."""
     try:
-        obj = r2.get_object(Bucket=R2_BUCKET, Key='enlil/latest.json')
-        return json.load(obj['Body']).get('runId')
+        obj = r2.get_object(Bucket=R2_BUCKET, Key=pointer_key(kind))
+        return json.load(obj['Body'])
     except r2.exceptions.NoSuchKey:
         return None
     except Exception as e:
         # Fail open: a read failure shouldn't stop data production. Worst case
         # is one redundant re-upload of a run we already have.
-        print(f'warning: could not read enlil/latest.json from R2: {e}')
+        print(f'warning: could not read {pointer_key(kind)} from R2: {e}')
         return None
+
+
+def published_run_id(r2):
+    """The published cone runId (kept as a name: --force and the CLI use it)."""
+    return (published_meta(r2, 'cone') or {}).get('runId')
 
 
 def published_run_id_via_worker():
@@ -299,7 +342,7 @@ def download_run(s3, run, dest):
         list(ex.map(get, keys))
 
 
-def upload_artifacts(r2, out_dir, run_id):
+def upload_artifacts(r2, out_dir, run_id, kind='cone'):
     """Upload a run's artifacts, uncompressed.
 
     ⚠️ **DO NOT pre-compress these and set `ContentEncoding` on the object.**
@@ -328,25 +371,48 @@ def upload_artifacts(r2, out_dir, run_id):
     octet-stream and have the WIDGET decompress with `DecompressionStream`, so
     no intermediary has an opinion about the encoding.
     """
+    folder = R2_FOLDER[kind]
+    if not RUN_ID_RE[kind].match(run_id):
+        # The worker routes frame URLs by runId pattern; a mismatched id would
+        # publish a run nobody can fetch.
+        raise ValueError(f'{run_id!r} is not a valid {kind} runId')
     names = sorted(os.listdir(out_dir))
-    print(f'uploading {len(names)} artifacts to r2://{R2_BUCKET}/enlil/{run_id}/')
+    print(f'uploading {len(names)} artifacts to r2://{R2_BUCKET}/{folder}{run_id}/')
     def put(name, key=None):
         ct = 'application/json' if name.endswith('.json') else 'application/octet-stream'
         r2.upload_file(os.path.join(out_dir, name), R2_BUCKET,
-                       key or f'enlil/{run_id}/{name}',
+                       key or f'{folder}{run_id}/{name}',
                        ExtraArgs={'ContentType': ct})
     with concurrent.futures.ThreadPoolExecutor(UPLOAD_WORKERS) as ex:
         list(ex.map(put, [n for n in names if n != 'meta.json']))
     put('meta.json')
-    # latest.json LAST: it is the pointer the worker serves, so everything it
+    # The pointer LAST: it is what the worker serves, so everything it
     # references must already exist.
-    put('meta.json', key='enlil/latest.json')
+    put('meta.json', key=pointer_key(kind))
 
 
-def prune_runs(r2):
-    r = r2.list_objects_v2(Bucket=R2_BUCKET, Prefix='enlil/', Delimiter='/')
-    runs = sorted(p['Prefix'] for p in r.get('CommonPrefixes', []))
-    for prefix in runs[:-KEEP_RUNS] if len(runs) > KEEP_RUNS else []:
+def runs_to_prune(prefixes, kind, keep, protected=None):
+    """Which run folders to delete: all but the newest `keep` of this product,
+    never the one the product's own pointer names.
+
+    Pure so it can be tested without R2. `prefixes` are CommonPrefixes listed
+    under R2_FOLDER[kind]; anything that is not a run of THIS product (a stray
+    folder, the other product) is ignored rather than deleted — prune never
+    reaches outside its own folder's runs.
+    """
+    folder = R2_FOLDER[kind]
+    runs = sorted(p for p in prefixes
+                  if p.startswith(folder) and RUN_ID_RE[kind].match(p[len(folder):].rstrip('/')))
+    doomed = runs[:-keep] if len(runs) > keep else []
+    return [p for p in doomed if p != f'{folder}{protected}/']
+
+
+def prune_runs(r2, kind):
+    folder = R2_FOLDER[kind]
+    r = r2.list_objects_v2(Bucket=R2_BUCKET, Prefix=folder, Delimiter='/')
+    prefixes = [p['Prefix'] for p in r.get('CommonPrefixes', [])]
+    protected = (published_meta(r2, kind) or {}).get('runId')
+    for prefix in runs_to_prune(prefixes, kind, KEEP[kind], protected):
         print(f'pruning {prefix}')
         token = None
         while True:
@@ -362,38 +428,28 @@ def prune_runs(r2):
             token = page['NextContinuationToken']
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--dry-run', action='store_true',
-                    help='download + extract only; no R2 access, no credentials needed')
-    ap.add_argument('--force', action='store_true',
-                    help='re-extract even if the worker already serves this run; if SWPC names '
-                         'a run the bucket does not have, re-extract the published one')
-    ap.add_argument('--run', default=None,
-                    help='extract this exact runId (e.g. 20260913_58512) instead of resolving '
-                         'the operational one — for backfilling a specific run')
-    ap.add_argument('--keep-out', default=None,
-                    help='write artifacts here instead of a temp dir (implies inspectable output)')
-    ap.add_argument('--allow-unofficial', action='store_true',
-                    help='take the newest run in the bucket instead of the one SWPC '
-                         'publishes — for local inspection only; the newest is often '
-                         'a single-CME analysis run (see official_run_number)')
-    args = ap.parse_args()
+def phase_timer():
+    """Per-phase timings. Without these, "why did this run take longer?" can only
+    be answered by reconstructing it from first principles afterwards — which is
+    exactly what happened when volumes landed and the run went 40 s -> 85 s.
+    One line in the log settles it next time."""
+    timings = {}
 
-    s3 = noaa_client()
+    def phase(name, fn, *a, **kw):
+        t0 = time.monotonic()
+        try:
+            return fn(*a, **kw)
+        finally:
+            timings[name] = time.monotonic() - t0
 
-    # Build the R2 client and read the published run BEFORE resolving anything.
-    # Credentials still fail in seconds rather than after a 435 MB download, and
-    # the published id is now available to the --force fallback below.
-    have_creds = all(os.environ.get(k) for k in
-                     ('R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'))
-    if not have_creds and not args.dry_run:
-        raise SystemExit('R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY '
-                         'must be set (or pass --dry-run)')
-    r2 = r2_client() if have_creds else None
-    current = published_run_id(r2) if r2 else published_run_id_via_worker()
-    print(f'currently published: {current}')
+    def report():
+        print('timings: ' + '  '.join(f'{k} {v:.1f}s' for k, v in timings.items())
+              + f'  total {sum(timings.values()):.1f}s')
+    return phase, report
 
+
+def run_cone(args, s3, r2, current):
+    """Publish the operational cone run (see module docstring)."""
     if args.allow_unofficial:
         run = find_newest_pv_run(s3)
         print(f'newest NOAA run (UNOFFICIAL): {run["runId"]} ({len(run["pvtims"])} pv frames)')
@@ -438,18 +494,7 @@ def main():
         print('up to date — nothing to do')
         return
 
-    # Per-phase timings. Without these, "why did this run take longer?" can only
-    # be answered by reconstructing it from first principles afterwards — which
-    # is exactly what happened when volumes landed and the run went 40 s -> 85 s.
-    # One line in the log settles it next time.
-    timings = {}
-    def phase(name, fn, *a, **kw):
-        t0 = time.monotonic()
-        try:
-            return fn(*a, **kw)
-        finally:
-            timings[name] = time.monotonic() - t0
-
+    phase, report = phase_timer()
     with tempfile.TemporaryDirectory(prefix='enlil_') as tmp:
         raw = os.path.join(tmp, 'raw')
         out = args.keep_out or os.path.join(tmp, 'out')
@@ -471,13 +516,150 @@ def main():
 
         if args.dry_run:
             print('dry run — skipping upload/prune')
-            print('timings: ' + '  '.join(f'{k} {v:.1f}s' for k, v in timings.items()))
+            report()
             return
-        phase('upload', upload_artifacts, r2, out, run['runId'])
-        phase('prune', prune_runs, r2)
-    print('timings: ' + '  '.join(f'{k} {v:.1f}s' for k, v in timings.items())
-          + f'  total {sum(timings.values()):.1f}s')
+        phase('upload', upload_artifacts, r2, out, run['runId'], 'cone')
+        phase('prune', prune_runs, r2, 'cone')
+    report()
     print('done')
+
+
+def run_ambient(args, r2):
+    """Publish the newest daily ambient run from NOMADS (see module docstring)."""
+    phase, report = phase_timer()
+    current = published_meta(r2, 'ambient') if r2 else None
+    print(f'currently published ambient run: {(current or {}).get("runId")}')
+    found, source, nc_path = None, None, args.local_file
+    if nc_path:
+        print(f'local ambient file: {nc_path}')
+    else:
+        found = nomads.find_latest_ambient(USER_AGENT)
+        if not found:
+            # Not an error: NCEP may not have written today's yet, and the
+            # published run still covers -48 h ... +120 h. `health` is the alarm
+            # for a real lapse.
+            print('no ambient run on NOMADS — leaving the published one in place')
+            return
+        print(f'NOMADS ambient run: {found["dir"]} '
+              f'(modified {found["lastModified"]}, {found["size"]} bytes)')
+        source = {'dir': found['dir'], 'lastModified': found['lastModified']}
+        published = (current or {}).get('source') or {}
+        # Idempotency on the listing, BEFORE downloading 131 MB.
+        if (not args.force and published.get('dir') == source['dir']
+                and published.get('lastModified') == source['lastModified']):
+            print('up to date — nothing to do')
+            return
+        if not found['settled']:
+            print(f'modified < {nomads.SETTLE_MINUTES} min ago — may still be being written; next tick')
+            return
+        ncmes = phase('verify', nomads.fetch_ncmes, found['inputsUrl'], USER_AGENT)
+        if ncmes != 0:
+            # Refuse rather than guess: a CME run published as "ambient" would be
+            # drawn with no outlines and no tracking — every CME in it unnamed.
+            raise SystemExit(f'{found["dir"]}: enlil.in says ncmes={ncmes}, '
+                             'not an ambient run — refusing')
+
+    with tempfile.TemporaryDirectory(prefix='enlil_amb_') as tmp:
+        if found:
+            nc_path = os.path.join(tmp, nomads.AMBIENT_SUBALL)
+            phase('download', nomads.download, found['suballUrl'], nc_path, found['size'], USER_AGENT)
+        out = args.keep_out or os.path.join(tmp, 'out')
+        meta = phase('extract', extract_ambient_run, nc_path, out, source=source)
+        if args.dry_run:
+            print('dry run — skipping upload/prune')
+            report()
+            return
+        if (current or {}).get('runId') == meta['runId'] and not args.force:
+            # NCEP re-wrote the same model run (new Last-Modified, same REFDATE).
+            # Frame URLs are cached `immutable` for a year, so overwriting them
+            # would leave anyone who already fetched a frame on the old bytes.
+            print(f'{meta["runId"]} is already published — skipping upload')
+            report()
+            return
+        phase('upload', upload_artifacts, r2, out, meta['runId'], 'ambient')
+        phase('prune', prune_runs, r2, 'ambient')
+    report()
+    print('done')
+
+
+def coverage_end(meta):
+    """When a run stops covering "now": its last frame plus its largest frame
+    gap — the slack the monitor's selectFrame and the worker both allow."""
+    times = [datetime.strptime(t, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+             for t in (meta or {}).get('times') or []]
+    if not times:
+        return None
+    gap = max([timedelta(hours=1)] + [b - a for a, b in zip(times, times[1:])])
+    return times[-1] + gap
+
+
+def run_health(args, r2):
+    """Exit non-zero if no published run will still cover now + horizon.
+
+    A green collect job is not evidence the site has data: every "nothing to do"
+    path exits 0 by design. This is the one check that fails when the transit
+    field is about to go blank, so GitHub's failure email fires.
+    """
+    need = datetime.now(timezone.utc) + timedelta(hours=args.horizon_hours)
+    ok = False
+    for kind in ('cone', 'ambient'):
+        meta = published_meta(r2, kind)
+        end = coverage_end(meta)
+        covers = end is not None and end >= need
+        ok = ok or covers
+        print(f'{kind:8s} {(meta or {}).get("runId") or "none":18s} '
+              f'covers until {end.strftime("%Y-%m-%dT%H:%MZ") if end else "-":17s} '
+              f'{"OK" if covers else "short"} (need now+{args.horizon_hours:g}h)')
+    if not ok:
+        raise SystemExit(f'no published run covers now + {args.horizon_hours:g} h — '
+                         "the monitor's transit field is about to go blank")
+    print('healthy')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('target', nargs='?', default='cone', choices=['cone', 'ambient', 'health'],
+                    help='product to collect, or `health` to check coverage (default: cone)')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='download + extract only; no R2 access, no credentials needed')
+    ap.add_argument('--force', action='store_true',
+                    help='re-extract even if this run is already published; for cone, if SWPC '
+                         'names a run the bucket does not have, re-extract the published one')
+    ap.add_argument('--run', default=None,
+                    help='cone: extract this exact runId (e.g. 20260913_58512) instead of '
+                         'resolving the operational one — for backfilling a specific run')
+    ap.add_argument('--keep-out', default=None,
+                    help='write artifacts here instead of a temp dir (implies inspectable output)')
+    ap.add_argument('--allow-unofficial', action='store_true',
+                    help='cone: take the newest run in the bucket instead of the one SWPC '
+                         'publishes — for local inspection only; the newest is often '
+                         'a single-CME analysis run (see official_run_number)')
+    ap.add_argument('--local-file', default=None,
+                    help='ambient: extract this local suball.nc instead of fetching from NOMADS')
+    ap.add_argument('--horizon-hours', type=float, default=12.0,
+                    help='health: required coverage beyond now, in hours (default: 12)')
+    args = ap.parse_args()
+
+    # Build the R2 client BEFORE resolving anything: credentials fail in
+    # seconds rather than after a long download.
+    have_creds = all(os.environ.get(k) for k in
+                     ('R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'))
+    if not have_creds and not args.dry_run:
+        raise SystemExit('R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY '
+                         'must be set (or pass --dry-run)')
+    r2 = r2_client() if have_creds else None
+
+    if args.target == 'health':
+        if not r2:
+            raise SystemExit('health needs R2 credentials')
+        run_health(args, r2)
+    elif args.target == 'ambient':
+        run_ambient(args, r2)
+    else:
+        # The published id feeds the up-to-date check and the --force fallback.
+        current = published_run_id(r2) if r2 else published_run_id_via_worker()
+        print(f'currently published cone run: {current}')
+        run_cone(args, noaa_client(), r2, current)
 
 
 if __name__ == '__main__':

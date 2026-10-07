@@ -3,10 +3,68 @@
 Extracts compact web artifacts from NOAA WSA-Enlil model runs for
 [SpaceWeatherViz](https://spaceweatherviz.com)'s monitor and heliosphere visualization.
 Runs on GitHub Actions hourly (`.github/workflows/collect.yml`) and publishes to
-Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
-`/api/enlil/frame/...`.
+Cloudflare R2, from which the site's worker serves `/api/enlil/run`, `/api/enlil/field`
+and `/api/enlil/frame/...`.
 
-## Pipeline (`pipeline.py`)
+## Two products
+
+| | **cone** (`pipeline.py cone`) | **ambient** (`pipeline.py ambient`) |
+|---|---|---|
+| What | the operational CME run | NCEP's daily no-CME background run (`ncmes=0`) |
+| Source | NOAA S3 `noaa-wsa-enlil-pds`, `pv-tim.NNNN.nc` | NCEP NOMADS `prod/wsa_enlil.<YYYYMMDD>/wsa_enlil.mrid00000000.suball.nc` |
+| Shape | 3D volumes (90 × 30 × 64) | three 2D cut planes; the Earth plane is used |
+| Published | slices, volumes, labels/blobs, line, meta | slices (`sldp` all zero), line, meta — **no volumes, no tracking** |
+| R2 | `enlil/cone/<YYYYMMDD_NNNNN>/`, pointer `enlil/cone/latest.json`, keep 10 | `enlil/ambient/amb_<YYYYMMDD>_<HH>/`, pointer `enlil/ambient/latest.json`, keep 2 |
+| Served by | `/api/enlil/run` (the `/enlil` 3D page) and `/api/enlil/field` | `/api/enlil/field` (the monitor), whenever no cone run covers now |
+
+Why the second one exists: S3 carries cone runs only, so in quiet stretches the newest
+cone run's window (`rundate` −48 h … +120 h) ran out and the monitor's transit field went
+blank — ~40 of ~280 days in 2026. The ambient run fills that gap. It was A/B-validated
+against run 58545, which exists in both sources: suball's `13` plane is the same Earth
+plane (r ≥ 0.998 for density ratio and speed), it folds exactly onto the published grid
+(lon 2:1, r 8:1), `vv` is m/s, and the published u8 slices differ by a median of 1/255.
+`tests/test_ambient.py` holds that comparison (set `SWV_AB_DIR` to run it on real data).
+
+⚠️ **The runId's shape decides the R2 folder** — `^\d{8}_\d+$` cone,
+`^amb_\d{8}_\d{2}$` ambient (`pipeline.RUN_ID_RE`). The worker resolves frame URLs by
+the same patterns (`worker/src/lib/enlilRuns.js`), so keep them in lockstep.
+
+## Workflow jobs (`collect.yml`)
+
+- **`cone`** and **`ambient`** — hourly (`23 * * * *`), independent, each in its own
+  concurrency group so a slow cone download never holds up the ambient one. Every
+  "nothing new" path exits 0.
+- **`health`** — after both, **fails** if no published run (either product) covers
+  now + 12 h. This is the alarm: a green collect job says nothing about whether the
+  site has data. Dispatch with a huge `horizon_hours` to test the failure path.
+- **`keepalive`** — monthly; re-enables the workflow through the API, because GitHub
+  disables scheduled workflows in public repos after 60 days without repo activity.
+- Manual dispatch: `target` = both | cone | ambient | health | keepalive, plus `force`,
+  `run_id` (cone) and `horizon_hours` (health).
+
+Skipped or hours-late ticks are harmless by construction: an ambient run covers
+−48 h … +120 h and stays on NOMADS ~2 days (~40 hourly chances), and the cone path
+keeps the last good run.
+
+## Ambient pipeline (`nomads.py`, `suball.py`)
+
+1. Walk NOMADS day folders newest-first; take `mrid00000000.suball.nc` (+ `inputs.tar.gz`).
+2. Idempotency on the file's Last-Modified **before** downloading ~131 MB. Files modified
+   < 15 min ago are left for the next tick (may still be being written).
+3. Refuse unless the run's `enlil.in` says `ncmes=0` — guards against NCEP ever reusing
+   `mrid00000000` for a CME run.
+4. `suball.py`: decode the int16 planes (`lo + (raw + 32768)·(hi − lo)/65535`, bounds from
+   each variable's `<tag>_min/_max` attributes — a raw read is meaningless), fold onto the
+   cone grid, ratio against the frame-0 azimuthal median (the cone runs' baseline), `vv`
+   m/s → km/s, every frame. Times come from the file's own `time` (~1.003 h steps).
+   `meta.json` carries `kind: 'ambient'`, `capabilities: {volumes: false, tracking: false}`,
+   `cmes: []`, and **no `grid.lat`** — the monitor gates volumes and tilt on it.
+5. Upload to `enlil/ambient/<runId>/`, pointer last; prune to 2.
+
+⚠️ Never derive `sldp` from a suball `cc` tracer: on cone runs `cc` is a different
+normalisation from DP, and ambient files carry no `cc` variables at all.
+
+## Cone pipeline (`pipeline.py cone`)
 
 1. Resolve the **operational** run — the number in SWPC's public animation manifest
    (`services.swpc.noaa.gov/products/animations/enlil.json`, frames named
@@ -23,8 +81,8 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
    by ~1.3 h; if the manifest can't be read or names a run not yet in the bucket the
    pipeline exits without republishing, keeping the last good run.
    `--allow-unofficial` restores newest-wins for local inspection.
-2. Idempotency check against the **live worker** (`/api/enlil/run` is public, so this
-   needs no credentials and behaves identically locally and in CI). Same run ⇒ exit.
+2. Idempotency check against R2's `enlil/cone/latest.json` (the live worker's
+   `/api/enlil/run` for a credential-free `--dry-run`). Same run ⇒ exit.
 3. Download the frames `frame_schedule()` selects (~113 files ≈ 860 MB), 8-way parallel.
    A run is a fixed 169 hourly frames where **frame N is `rundate` + (N − 48) h** —
    48 h of hindcast, then 120 h of forecast (verified on 20260907_58498:
@@ -56,12 +114,14 @@ Cloudflare R2, from which the site's worker serves `/api/enlil/run` and
      instead; index-based boundaries would land somewhere else entirely.
 4. `extract.py`: quantize the fields and track DP blobs through the float 3D volumes
    with `regions.py`. Volume *exports* stay off until the site's 3D view lands.
-5. Upload to `enlil/<runId>/…`; `enlil/latest.json` is written **last** so the pointer
-   never references a half-uploaded run.
-6. Prune R2 to the newest 10 runs.
+5. Upload to `enlil/cone/<runId>/…`; `enlil/cone/latest.json` is written **last** so the
+   pointer never references a half-uploaded run.
+6. Prune `enlil/cone/` to the newest 10 runs — never the one the pointer names, never
+   anything outside the folder.
 
-Local dry run (no credentials): `python pipeline.py --dry-run [--force] [--keep-out out/x]
-[--allow-unofficial]`.
+Local dry runs (no credentials):
+`python pipeline.py cone --dry-run [--force] [--keep-out out/x] [--allow-unofficial]`,
+`python pipeline.py ambient --dry-run [--local-file suball.nc] [--keep-out out/amb]`.
 
 Secrets (Actions → repository secrets): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY` — an R2 API token scoped to object read/write on the one bucket.
